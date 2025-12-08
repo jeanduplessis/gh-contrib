@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""
+Fetch GitHub issues and PRs a user has interacted with in a given organization.
+
+Uses the gh CLI for authentication.
+
+Usage:
+    ./gh-contrib --username <username> --org <org> [--days <days>]
+
+Requirements:
+    - gh CLI installed and authenticated (https://cli.github.com/)
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+# Constants
+SEARCH_LIMIT = 200
+MAX_WORKERS = 10
+TITLE_TRUNCATE_LENGTH = 60
+API_PAGE_SIZE = 100
+PASSIVE_INTERACTION_TYPES = frozenset({"review-requested", "assignee", "mentioned"})
+
+
+@dataclass
+class UserStats:
+    """Statistics for a user's GitHub activity."""
+    prs_authored: int = 0
+    prs_reviewed: int = 0
+    prs_commented: int = 0
+    issues_authored: int = 0
+    issues_commented: int = 0
+
+    def total(self) -> int:
+        """Return total activity count."""
+        return sum([
+            self.prs_authored,
+            self.prs_reviewed,
+            self.prs_commented,
+            self.issues_authored,
+            self.issues_commented
+        ])
+
+    def as_list(self) -> list[int]:
+        """Return stats as a list for table formatting."""
+        return [
+            self.prs_authored,
+            self.prs_reviewed,
+            self.prs_commented,
+            self.issues_authored,
+            self.issues_commented
+        ]
+
+
+def is_pull_request(item: dict) -> bool:
+    """Determine if an item is a pull request."""
+    return (
+        item.get("isPullRequest", False)
+        or item["state"] == "MERGED"
+        or "/pull/" in item["url"]
+    )
+
+
+def parse_interaction(interaction: str, default_username: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """Parse interaction string into base type and username.
+
+    Args:
+        interaction: String like "author (@username)" or "author"
+        default_username: Username to use if not tagged
+
+    Returns:
+        Tuple of (base_interaction, username)
+    """
+    if " (@" in interaction:
+        base = interaction.split(" (@")[0]
+        username = interaction.split(" (@")[1].rstrip(")")
+        return base, username
+    return interaction, default_username
+
+
+def group_by_repository(items: list[dict]) -> dict[str, list[dict]]:
+    """Group items by repository name."""
+    by_repo = defaultdict(list)
+    for item in items:
+        repo_name = item["repository"]["name"]
+        by_repo[repo_name].append(item)
+    return dict(by_repo)
+
+
+def gh_search(args: list[str]) -> list[dict]:
+    """Execute a gh search command and return results."""
+    cmd = ["gh", "search", "issues"] + args + [
+        "--include-prs",
+        "--json", "url,title,state,repository,updatedAt,createdAt,author,assignees,isPullRequest,number",
+        "--limit", str(SEARCH_LIMIT)
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error calling gh search: {e.stderr}")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("Error: gh CLI not found. Install from https://cli.github.com/")
+        sys.exit(1)
+
+
+def gh_api(endpoint: str) -> Optional[dict]:
+    """Execute a GitHub API call using gh CLI."""
+    cmd = ["gh", "api", endpoint]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+    except subprocess.CalledProcessError:
+        return None
+
+
+# Module-level cache for API responses
+_api_cache: dict[str, Optional[dict]] = {}
+
+
+def gh_api_cached(endpoint: str) -> Optional[dict]:
+    """Execute a GitHub API call with caching to avoid redundant requests.
+
+    This cache persists for the entire script execution, significantly reducing
+    API calls when processing multiple users on the same items.
+    """
+    if endpoint in _api_cache:
+        return _api_cache[endpoint]
+    result = gh_api(endpoint)
+    _api_cache[endpoint] = result
+    return result
+
+
+def parse_datetime(dt_str: str) -> datetime:
+    """Parse ISO datetime string to datetime object."""
+    # Handle both formats: with and without milliseconds
+    dt_str = dt_str.replace("Z", "+00:00")
+    return datetime.fromisoformat(dt_str)
+
+
+def get_interaction_details(item: dict, username: str, since: datetime, until: datetime) -> tuple[list[str], Optional[datetime]]:
+    """Determine how the user interacted with this issue/PR and when."""
+    interactions = []
+    latest_interaction: Optional[datetime] = None
+    username_lower = username.lower()
+
+    # Check if user is author (use createdAt from the item)
+    if item.get("author", {}).get("login", "").lower() == username_lower:
+        interactions.append("author")
+        # For author, we consider the creation time
+        if created_at := item.get("createdAt"):
+            created_dt = parse_datetime(created_at)
+            if since <= created_dt <= until:
+                if latest_interaction is None or created_dt > latest_interaction:
+                    latest_interaction = created_dt
+
+    # Check if user is assignee (passive, no timestamp to check)
+    assignees = item.get("assignees", [])
+    if any(a.get("login", "").lower() == username_lower for a in assignees):
+        interactions.append("assignee")
+
+    return interactions, latest_interaction
+
+
+def fetch_additional_interactions(item: dict, username: str, since: datetime, until: datetime) -> tuple[list[str], Optional[datetime]]:
+    """Fetch additional interaction details from API (comments, reviews) with timestamps."""
+    interactions = []
+    latest_interaction: Optional[datetime] = None
+    username_lower = username.lower()
+    repo = item["repository"]["nameWithOwner"]
+    number = item["number"]
+
+    # Check comments
+    comments = gh_api_cached(f"repos/{repo}/issues/{number}/comments?per_page={API_PAGE_SIZE}")
+    if comments:
+        user_comments = [
+            c for c in comments
+            if c.get("user", {}).get("login", "").lower() == username_lower
+        ]
+        # Filter by date and find latest
+        for comment in user_comments:
+            comment_dt = parse_datetime(comment["created_at"])
+            if since <= comment_dt <= until:
+                if "commenter" not in interactions:
+                    interactions.append("commenter")
+                if latest_interaction is None or comment_dt > latest_interaction:
+                    latest_interaction = comment_dt
+
+    # Check PR reviews if it's a PR
+    if is_pull_request(item):
+        reviews = gh_api_cached(f"repos/{repo}/pulls/{number}/reviews?per_page={API_PAGE_SIZE}")
+        if reviews:
+            user_reviews = [
+                r for r in reviews
+                if r.get("user", {}).get("login", "").lower() == username_lower
+            ]
+            # Filter by date and find latest
+            for review in user_reviews:
+                review_dt = parse_datetime(review["submitted_at"])
+                if since <= review_dt <= until:
+                    if "reviewer" not in interactions:
+                        interactions.append("reviewer")
+                    if latest_interaction is None or review_dt > latest_interaction:
+                        latest_interaction = review_dt
+
+    return interactions, latest_interaction
+
+
+def process_item(item: dict, username: str, since: datetime, until: datetime) -> dict:
+    """Process a single item to get all interaction details."""
+    interactions, latest_basic_interaction = get_interaction_details(item, username, since, until)
+    additional, latest_additional_interaction = fetch_additional_interactions(item, username, since, until)
+    interactions.extend(additional)
+
+    # Determine the latest interaction timestamp
+    latest_interaction = None
+    if latest_basic_interaction and latest_additional_interaction:
+        latest_interaction = max(latest_basic_interaction, latest_additional_interaction)
+    else:
+        latest_interaction = latest_basic_interaction or latest_additional_interaction
+
+    # If no specific interaction found, mark as "mentioned" (catch-all for involves)
+    if not interactions:
+        interactions.append("mentioned")
+
+    item["_interactions"] = interactions
+    item["_latest_interaction"] = latest_interaction
+    return item
+
+
+def format_table_row(item: dict) -> str:
+    """Format an issue/PR item as a markdown table row."""
+    state = item["state"]
+    item_type = "PR" if is_pull_request(item) else "Issue"
+    interactions = ", ".join(item.get("_interactions", []))
+    title = item["title"]
+    # Truncate long titles
+    if len(title) > TITLE_TRUNCATE_LENGTH:
+        title = title[:TITLE_TRUNCATE_LENGTH - 3] + "..."
+    url = item["url"]
+    return f"| {item_type} | {state} | [{title}]({url}) | {interactions} |"
+
+
+def process_item_for_users(item: dict, usernames: list[str], since_dt: datetime, end_dt: datetime) -> dict:
+    """Process an item for multiple users and combine their interactions."""
+    all_interactions = []
+    latest_interaction = None
+    for username in item.get("_usernames", []):
+        processed = process_item(item.copy(), username, since_dt, end_dt)
+        interactions = processed.get("_interactions", [])
+        item_latest = processed.get("_latest_interaction")
+        # Tag interactions with username if multiple users
+        if len(usernames) > 1:
+            for interaction in interactions:
+                tagged = f"{interaction} (@{username})"
+                if tagged not in all_interactions:
+                    all_interactions.append(tagged)
+        else:
+            for interaction in interactions:
+                if interaction not in all_interactions:
+                    all_interactions.append(interaction)
+        if item_latest and (latest_interaction is None or item_latest > latest_interaction):
+            latest_interaction = item_latest
+    item["_interactions"] = all_interactions
+    item["_latest_interaction"] = latest_interaction
+    return item
+
+
+def main() -> None:
+    """Main entry point for the script."""
+    parser = argparse.ArgumentParser(
+        description="Fetch GitHub issues and PRs a user has interacted with in an organization."
+    )
+    parser.add_argument(
+        "--username", "-u",
+        required=True,
+        help="GitHub username(s) to search for (comma-separated)"
+    )
+    parser.add_argument(
+        "--org", "-o",
+        required=True,
+        help="GitHub organization(s) to search in (comma-separated)"
+    )
+    parser.add_argument(
+        "--days", "-d",
+        type=int,
+        default=7,
+        help="Number of days to look back (default: 7)"
+    )
+    parser.add_argument(
+        "--end-date", "-e",
+        type=str,
+        default=None,
+        help="End date for the search window (format: YYYY-MM-DD, default: today)"
+    )
+    parser.add_argument(
+        "--last-week",
+        action="store_true",
+        help="Search the last complete week (Monday to Sunday)"
+    )
+    parser.add_argument(
+        "--show-filtered",
+        action="store_true",
+        help="Show filtered out items in a separate section"
+    )
+
+    args = parser.parse_args()
+
+    # Calculate date range
+    if args.last_week:
+        # Find last Sunday (or today if today is Sunday)
+        today = datetime.now(timezone.utc)
+        days_since_sunday = (today.weekday() + 1) % 7  # Monday=0, Sunday=6 -> days since last Sunday
+        last_sunday = today - timedelta(days=days_since_sunday)
+        end_dt = last_sunday.replace(hour=23, minute=59, second=59)
+        since_dt = end_dt - timedelta(days=6)  # Monday to Sunday = 7 days
+        since_dt = since_dt.replace(hour=0, minute=0, second=0)
+    elif args.end_date:
+        end_dt = datetime.strptime(args.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        # Set to end of day
+        end_dt = end_dt.replace(hour=23, minute=59, second=59)
+        since_dt = end_dt - timedelta(days=args.days)
+    else:
+        end_dt = datetime.now(timezone.utc)
+        since_dt = end_dt - timedelta(days=args.days)
+
+    since_date = since_dt.strftime("%Y-%m-%d")
+    end_date = end_dt.strftime("%Y-%m-%d")
+
+    usernames = [u.strip() for u in args.username.split(",")]
+    orgs = [o.strip() for o in args.org.split(",")]
+    orgs_str = ", ".join(orgs)
+    users_str = ", ".join(f"@{u}" for u in usernames)
+    print(f"Fetching GitHub activity for {users_str} in {orgs_str} from {since_date} to {end_date}...\n")
+
+    # Fetch items from all orgs and users
+    all_items: dict[str, dict] = {}  # url -> item, to dedupe
+    for org in orgs:
+        for username in usernames:
+            # Use --involves which covers: author, commenter, mentions, assignee, review-requested, reviewed-by
+            items = gh_search([
+                "--involves", username,
+                "--owner", org,
+                "--updated", f">={since_date}"
+            ])
+            for item in items:
+                if item["url"] not in all_items:
+                    all_items[item["url"]] = item
+                    all_items[item["url"]]["_usernames"] = [username]
+                elif username not in all_items[item["url"]]["_usernames"]:
+                    all_items[item["url"]]["_usernames"].append(username)
+
+    items_list = list(all_items.values())
+
+    if not items_list:
+        print("No activity found.")
+        return
+
+    print(f"Found {len(items_list)} candidates. Fetching interaction details and filtering by date...")
+
+    # Process items in parallel to get interaction details for each user
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_item_for_users, item, usernames, since_dt, end_dt): item for item in items_list}
+        processed_items = []
+        for future in as_completed(futures):
+            processed_items.append(future.result())
+
+    # Filter out items where the only interaction is passive (review-requested, assignee)
+    active_items = []
+    filtered_items = []
+    for item in processed_items:
+        # Extract base interaction types (without username tags)
+        interactions = item.get("_interactions", [])
+        base_interactions = set()
+        for interaction in interactions:
+            # Handle tagged format "type (@username)"
+            base, _ = parse_interaction(interaction)
+            base_interactions.add(base)
+        is_passive = base_interactions.issubset(PASSIVE_INTERACTION_TYPES)
+        has_recent = item.get("_latest_interaction") is not None
+        if not is_passive and has_recent:
+            active_items.append(item)
+        else:
+            filtered_items.append(item)
+
+    # Sort by latest user interaction descending
+    active_items.sort(key=lambda x: x["_latest_interaction"], reverse=True)
+
+    # Print results
+    if len(usernames) == 1:
+        # Single user: group by repository
+        by_repo = group_by_repository(active_items)
+
+        print(f"\n## Active Participation\n")
+        print(f"Found {len(active_items)} issues/PRs with active participation across {len(by_repo)} repositories")
+        if filtered_items:
+            print(f"(filtered out {len(filtered_items)} items with only passive/old interactions)\n")
+
+        for repo_name in sorted(by_repo.keys()):
+            repo_items = by_repo[repo_name]
+            print(f"\n### {repo_name} ({len(repo_items)} items)\n")
+            print("| Type | State | Title | Interactions |")
+            print("|------|-------|-------|--------------|")
+            for item in repo_items:
+                print(format_table_row(item))
+    else:
+        # Multiple users: group by user, then by repository
+        print(f"\n## Active Participation\n")
+        print(f"Found {len(active_items)} unique issues/PRs with active participation")
+        if filtered_items:
+            print(f"(filtered out {len(filtered_items)} items with only passive/old interactions)\n")
+
+        for username in usernames:
+            # Filter items for this user with active interactions
+            user_items = []
+            for item in active_items:
+                user_interactions = [
+                    i for i in item.get("_interactions", [])
+                    if f"(@{username})" in i
+                ]
+                # Check if user has active (non-passive) interactions
+                base_interactions = set(parse_interaction(i)[0] for i in user_interactions)
+                if base_interactions and not base_interactions.issubset(PASSIVE_INTERACTION_TYPES):
+                    item_copy = item.copy()
+                    item_copy["_interactions"] = user_interactions
+                    user_items.append(item_copy)
+
+            if not user_items:
+                continue
+
+            # Group by repository
+            by_repo = group_by_repository(user_items)
+
+            print(f"\n## @{username}\n")
+            print(f"Found {len(user_items)} issues/PRs across {len(by_repo)} repositories\n")
+
+            for repo_name in sorted(by_repo.keys()):
+                repo_items = by_repo[repo_name]
+                print(f"\n### {repo_name} ({len(repo_items)} items)\n")
+                print("| Type | State | Title | Interactions |")
+                print("|------|-------|-------|--------------|")
+                for item in repo_items:
+                    print(format_table_row(item))
+
+    # Summary statistics - per user breakdown
+    user_stats: dict[str, UserStats] = {}
+
+    # Process each item and build per-user statistics
+    for item in active_items:
+        for interaction in item.get("_interactions", []):
+            # Parse username and base interaction type
+            base_interaction, username = parse_interaction(
+                interaction,
+                usernames[0] if len(usernames) == 1 else None
+            )
+
+            if username is None:
+                continue
+
+            # Initialize user stats if needed
+            if username not in user_stats:
+                user_stats[username] = UserStats()
+
+            # Map interaction to appropriate counter
+            if base_interaction == "author":
+                if is_pull_request(item):
+                    user_stats[username].prs_authored += 1
+                else:
+                    user_stats[username].issues_authored += 1
+            elif base_interaction == "reviewer" and is_pull_request(item):
+                user_stats[username].prs_reviewed += 1
+            elif base_interaction == "commenter":
+                if is_pull_request(item):
+                    user_stats[username].prs_commented += 1
+                else:
+                    user_stats[username].issues_commented += 1
+
+    # Print summary table
+    print(f"\n## Summary\n")
+
+    # Define column headers
+    headers = ["Username", "PRs Authored", "PRs Reviewed", "PRs Commented", "Issues Authored", "Issues Commented"]
+
+    # Sort by total activity (sum of all interactions) descending
+    sorted_users = sorted(
+        user_stats.items(),
+        key=lambda x: x[1].total(),
+        reverse=True
+    )
+
+    # Calculate column widths
+    col_widths = [len(h) for h in headers]
+    for username, stats in sorted_users:
+        values = [username] + [str(v) for v in stats.as_list()]
+        col_widths = [max(cw, len(val)) for cw, val in zip(col_widths, values)]
+
+    # Print header row
+    header_row = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
+    print(header_row)
+
+    # Print separator row
+    separator = "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"
+    print(separator)
+
+    # Print data rows
+    for username, stats in sorted_users:
+        values = [username] + [str(v) for v in stats.as_list()]
+        row = "| " + " | ".join(v.ljust(w) for v, w in zip(values, col_widths)) + " |"
+        print(row)
+
+    # Print totals row
+    if sorted_users:
+        # Calculate totals for each column
+        totals = [0] * 5  # 5 stat columns
+        for _, stats in sorted_users:
+            stats_list = stats.as_list()
+            totals = [t + s for t, s in zip(totals, stats_list)]
+
+        # Print separator before totals
+        print(separator)
+
+        # Print totals row
+        total_values = ["**Total**"] + [str(v) for v in totals]
+        total_row = "| " + " | ".join(v.ljust(w) for v, w in zip(total_values, col_widths)) + " |"
+        print(total_row)
+
+    # Show filtered items if requested
+    if args.show_filtered and filtered_items:
+        print(f"\n## Filtered Out ({len(filtered_items)} items)\n")
+        print("Items with only passive interactions (review-requested, assignee, mentioned) or no recent activity:\n")
+
+        # Group filtered by repository
+        filtered_by_repo = group_by_repository(filtered_items)
+
+        for repo_name in sorted(filtered_by_repo.keys()):
+            repo_items = filtered_by_repo[repo_name]
+            print(f"\n### {repo_name} ({len(repo_items)} items)\n")
+            print("| Type | State | Title | Interactions |")
+            print("|------|-------|-------|--------------|")
+            for item in repo_items:
+                print(format_table_row(item))
+
+
+if __name__ == "__main__":
+    main()
