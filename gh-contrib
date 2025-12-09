@@ -489,7 +489,7 @@ def main() -> None:
     print(f"\n## Summary\n")
 
     # Define column headers
-    headers = ["Username", "PRs Authored", "PRs Reviewed", "PRs Commented", "Issues Authored", "Issues Commented"]
+    headers = ["Username", "PRs Authored", "PRs Reviewed", "PRs Commented", "Issues Authored", "Issues Commented", "Total"]
 
     # Sort by total activity (sum of all interactions) descending
     sorted_users = sorted(
@@ -501,7 +501,7 @@ def main() -> None:
     # Calculate column widths
     col_widths = [len(h) for h in headers]
     for username, stats in sorted_users:
-        values = [username] + [str(v) for v in stats.as_list()]
+        values = [username] + [str(v) for v in stats.as_list()] + [str(stats.total())]
         col_widths = [max(cw, len(val)) for cw, val in zip(col_widths, values)]
 
     # Print header row
@@ -514,7 +514,7 @@ def main() -> None:
 
     # Print data rows
     for username, stats in sorted_users:
-        values = [username] + [str(v) for v in stats.as_list()]
+        values = [username] + [str(v) for v in stats.as_list()] + [str(stats.total())]
         row = "| " + " | ".join(v.ljust(w) for v, w in zip(values, col_widths)) + " |"
         print(row)
 
@@ -529,8 +529,9 @@ def main() -> None:
         # Print separator before totals
         print(separator)
 
-        # Print totals row
-        total_values = ["**Total**"] + [str(v) for v in totals]
+        # Print totals row, including a grand total (sum of all totals)
+        grand_total = sum(totals)
+        total_values = ["**Total**"] + [str(v) for v in totals] + [str(grand_total)]
         total_row = "| " + " | ".join(v.ljust(w) for v, w in zip(total_values, col_widths)) + " |"
         print(total_row)
 
