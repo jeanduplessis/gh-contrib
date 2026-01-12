@@ -33,4 +33,4 @@ control-planes-last-week-debug:
 	$(PYTHON) ./gh-contrib --username jeanduplessis,phisco,jbw976,haarchri,adamwg,negz,ezgidemirel,lsviben --org crossplane,crossplane-contrib --last-week --debug
 
 control-planes-trends:
-	$(PYTHON) ./gh-contrib --username jeanduplessis,phisco,jbw976,haarchri,adamwg,negz,ezgidemirel,lsviben --org crossplane,crossplane-contrib --trend --weeks 4
+	$(PYTHON) ./gh-contrib --username jeanduplessis,phisco,jbw976,haarchri,adamwg,negz,ezgidemirel,lsviben --org crossplane,crossplane-contrib --trend --weeks 5
