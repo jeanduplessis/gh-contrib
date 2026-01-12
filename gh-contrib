@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,24 @@ ALL_METRICS = ["prs-authored", "prs-reviewed", "prs-commented", "issues-authored
 
 # Cache version - bump when cache format changes
 CACHE_VERSION = 1
+
+# Health stats constants
+HEALTH_DB_VERSION = 1
+HEALTH_METRICS = [
+    "open-issues", "open-prs", "new-issues", "new-prs",
+    "days-since-release", "avg-issue-response", "avg-pr-response", "avg-pr-cycle"
+]
+VALID_HEALTH_METRICS = frozenset(HEALTH_METRICS)
+
+# Bot detection patterns
+BOT_SUFFIXES = {"[bot]"}
+KNOWN_BOTS = frozenset({
+    "dependabot", "dependabot-preview", "renovate", "renovate-bot",
+    "github-actions", "codecov", "codecov-commenter", "sonarcloud",
+    "stale", "mergify", "semantic-release-bot", "greenkeeper"
+})
+
+HEALTH_SAMPLE_SIZE = 50  # Items to sample for response time
 
 
 def parse_date_arg(value: str) -> datetime:
@@ -209,6 +228,275 @@ class FetchResult:
     active_items: list[dict]
     filtered_items: list[dict]
     user_stats: dict[str, UserStats]
+
+
+@dataclass
+class RepoHealthMetrics:
+    """Health metrics snapshot for a repository for a specific week."""
+    repo_full_name: str
+    github_id: int
+    node_id: str
+    week_start: datetime
+    week_end: datetime
+
+    # Core counts
+    open_issues: int
+    open_prs: int
+    new_issues: int
+    new_prs: int
+
+    # Release
+    days_since_release: Optional[int]
+    last_release_tag: Optional[str]
+
+    # Response times with sample metadata
+    avg_issue_response_hours: Optional[float]
+    avg_pr_response_hours: Optional[float]
+    issue_response_sample_size: int
+    pr_response_sample_size: int
+
+    # Cycle time
+    avg_pr_cycle_hours: Optional[float]
+    merged_pr_count: int
+
+
+def get_health_db_path() -> Path:
+    """Return path to health stats database, creating directory if needed."""
+    db_dir = Path.home() / ".gh-contrib"
+    db_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return db_dir / "health.db"
+
+
+def init_health_db() -> sqlite3.Connection:
+    """Initialize health database with schema and version tracking."""
+    conn = sqlite3.connect(str(get_health_db_path()))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
+
+    # Check if database is initialized
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_info'"
+    )
+
+    if cursor.fetchone() is None:
+        # Create new database
+        conn.executescript("""
+            CREATE TABLE schema_info (
+                version INTEGER PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE repos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                github_id INTEGER NOT NULL UNIQUE,
+                node_id TEXT NOT NULL,
+                org TEXT NOT NULL,
+                name TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE health_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id INTEGER NOT NULL,
+                week_start DATE NOT NULL,
+                week_end DATE NOT NULL,
+                open_issues INTEGER NOT NULL,
+                open_prs INTEGER NOT NULL,
+                new_issues INTEGER NOT NULL,
+                new_prs INTEGER NOT NULL,
+                days_since_release INTEGER,
+                last_release_tag TEXT,
+                avg_issue_response_hours REAL,
+                avg_pr_response_hours REAL,
+                issue_response_sample_size INTEGER,
+                pr_response_sample_size INTEGER,
+                avg_pr_cycle_hours REAL,
+                merged_pr_count INTEGER,
+                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+                UNIQUE(repo_id, week_start)
+            );
+
+            CREATE INDEX idx_repos_github_id ON repos(github_id);
+            CREATE INDEX idx_repos_org ON repos(org);
+            CREATE INDEX idx_repos_full_name ON repos(full_name);
+            CREATE INDEX idx_snapshots_repo_week ON health_snapshots(repo_id, week_start);
+            CREATE INDEX idx_snapshots_week ON health_snapshots(week_start);
+        """)
+        conn.execute("INSERT INTO schema_info (version) VALUES (?)", (HEALTH_DB_VERSION,))
+        conn.commit()
+    else:
+        # Handle future migrations
+        cursor = conn.execute("SELECT MAX(version) FROM schema_info")
+        current_version = cursor.fetchone()[0] or 0
+        if current_version < HEALTH_DB_VERSION:
+            conn.execute("INSERT INTO schema_info (version) VALUES (?)", (HEALTH_DB_VERSION,))
+            conn.commit()
+
+    return conn
+
+
+def get_or_create_repo(
+    conn: sqlite3.Connection,
+    github_id: int,
+    node_id: str,
+    org: str,
+    name: str,
+    full_name: str
+) -> int:
+    """Get or create repository entry, handling renames via github_id."""
+    cursor = conn.execute(
+        "SELECT id, full_name FROM repos WHERE github_id = ?", (github_id,)
+    )
+    row = cursor.fetchone()
+
+    if row:
+        repo_id = row["id"]
+        # Update if renamed
+        if row["full_name"] != full_name:
+            conn.execute(
+                "UPDATE repos SET org = ?, name = ?, full_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (org, name, full_name, repo_id)
+            )
+            conn.commit()
+        return repo_id
+
+    # Create new repo, handling race condition where another process may have inserted
+    try:
+        cursor = conn.execute(
+            "INSERT INTO repos (github_id, node_id, org, name, full_name) VALUES (?, ?, ?, ?, ?)",
+            (github_id, node_id, org, name, full_name)
+        )
+        conn.commit()
+        return cursor.lastrowid
+    except sqlite3.IntegrityError:
+        # Another process inserted the repo - re-select to get the existing repo_id
+        cursor = conn.execute(
+            "SELECT id FROM repos WHERE github_id = ?", (github_id,)
+        )
+        row = cursor.fetchone()
+        return row["id"]
+
+
+def save_health_snapshot(conn: sqlite3.Connection, metrics: RepoHealthMetrics) -> None:
+    """Save or update health metrics snapshot for a repo and week."""
+    # Parse org and name from full_name
+    parts = metrics.repo_full_name.split("/", 1)
+    org, name = parts[0], parts[1] if len(parts) > 1 else parts[0]
+
+    # Get or create repo entry
+    repo_id = get_or_create_repo(
+        conn, metrics.github_id, metrics.node_id, org, name, metrics.repo_full_name
+    )
+
+    # Format dates for SQLite
+    week_start_str = metrics.week_start.strftime("%Y-%m-%d")
+    week_end_str = metrics.week_end.strftime("%Y-%m-%d")
+
+    # UPSERT: insert or update on conflict
+    conn.execute(
+        """INSERT INTO health_snapshots (
+               repo_id, week_start, week_end, open_issues, open_prs, new_issues, new_prs,
+               days_since_release, last_release_tag, avg_issue_response_hours, avg_pr_response_hours,
+               issue_response_sample_size, pr_response_sample_size, avg_pr_cycle_hours, merged_pr_count
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(repo_id, week_start) DO UPDATE SET
+               week_end=excluded.week_end,
+               open_issues=excluded.open_issues,
+               open_prs=excluded.open_prs,
+               new_issues=excluded.new_issues,
+               new_prs=excluded.new_prs,
+               days_since_release=excluded.days_since_release,
+               last_release_tag=excluded.last_release_tag,
+               avg_issue_response_hours=excluded.avg_issue_response_hours,
+               avg_pr_response_hours=excluded.avg_pr_response_hours,
+               issue_response_sample_size=excluded.issue_response_sample_size,
+               pr_response_sample_size=excluded.pr_response_sample_size,
+               avg_pr_cycle_hours=excluded.avg_pr_cycle_hours,
+               merged_pr_count=excluded.merged_pr_count,
+               collected_at=CURRENT_TIMESTAMP""",
+        (
+            repo_id, week_start_str, week_end_str, metrics.open_issues, metrics.open_prs,
+            metrics.new_issues, metrics.new_prs, metrics.days_since_release, metrics.last_release_tag,
+            metrics.avg_issue_response_hours, metrics.avg_pr_response_hours,
+            metrics.issue_response_sample_size, metrics.pr_response_sample_size,
+            metrics.avg_pr_cycle_hours, metrics.merged_pr_count
+        )
+    )
+    conn.commit()
+
+
+def load_health_snapshots(
+    conn: sqlite3.Connection,
+    github_ids: list[int],
+    num_weeks: int
+) -> dict[int, list[RepoHealthMetrics]]:
+    """Load health snapshots for repos over recent weeks."""
+    if not github_ids:
+        return {}
+
+    placeholders = ",".join("?" * len(github_ids))
+    query = f"""
+        SELECT r.github_id, r.node_id, r.full_name, s.week_start, s.week_end,
+               s.open_issues, s.open_prs, s.new_issues, s.new_prs,
+               s.days_since_release, s.last_release_tag,
+               s.avg_issue_response_hours, s.avg_pr_response_hours,
+               s.issue_response_sample_size, s.pr_response_sample_size,
+               s.avg_pr_cycle_hours, s.merged_pr_count
+        FROM health_snapshots s
+        JOIN repos r ON s.repo_id = r.id
+        WHERE r.github_id IN ({placeholders})
+        ORDER BY r.github_id, s.week_start DESC
+    """
+
+    cursor = conn.execute(query, github_ids)
+    results: dict[int, list[RepoHealthMetrics]] = {gid: [] for gid in github_ids}
+
+    for row in cursor:
+        github_id = row["github_id"]
+        if len(results[github_id]) >= num_weeks:
+            continue
+
+        week_start = datetime.strptime(row["week_start"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        week_end = datetime.strptime(row["week_end"], "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
+        )
+
+        metrics = RepoHealthMetrics(
+            repo_full_name=row["full_name"],
+            github_id=github_id,
+            node_id=row["node_id"],
+            week_start=week_start,
+            week_end=week_end,
+            open_issues=row["open_issues"],
+            open_prs=row["open_prs"],
+            new_issues=row["new_issues"],
+            new_prs=row["new_prs"],
+            days_since_release=row["days_since_release"],
+            last_release_tag=row["last_release_tag"],
+            avg_issue_response_hours=row["avg_issue_response_hours"],
+            avg_pr_response_hours=row["avg_pr_response_hours"],
+            issue_response_sample_size=row["issue_response_sample_size"] or 0,
+            pr_response_sample_size=row["pr_response_sample_size"] or 0,
+            avg_pr_cycle_hours=row["avg_pr_cycle_hours"],
+            merged_pr_count=row["merged_pr_count"] or 0
+        )
+        results[github_id].append(metrics)
+
+    return results
+
+
+def get_cached_weeks(conn: sqlite3.Connection, github_id: int) -> set[str]:
+    """Get cached week_start dates for a repository."""
+    cursor = conn.execute(
+        "SELECT s.week_start FROM health_snapshots s JOIN repos r ON s.repo_id = r.id WHERE r.github_id = ?",
+        (github_id,)
+    )
+    return {row["week_start"] for row in cursor}
 
 
 def is_pull_request(item: dict) -> bool:
