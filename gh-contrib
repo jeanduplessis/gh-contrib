@@ -67,10 +67,10 @@ HEALTH_METRIC_FORMATTERS = {
     "open-prs": lambda m: str(m.open_prs),
     "new-issues": lambda m: str(m.new_issues),
     "new-prs": lambda m: str(m.new_prs),
-    "days-since-release": lambda m: str(m.days_since_release) if m.days_since_release is not None else "N/A",
-    "avg-issue-response": lambda m: f"{m.avg_issue_response_hours:.1f}" if m.avg_issue_response_hours is not None else "N/A",
-    "avg-pr-response": lambda m: f"{m.avg_pr_response_hours:.1f}" if m.avg_pr_response_hours is not None else "N/A",
-    "avg-pr-cycle": lambda m: f"{m.avg_pr_cycle_hours:.1f}" if m.avg_pr_cycle_hours is not None else "N/A"
+    "days-since-release": lambda m: f"{m.days_since_release}d ({m.last_release_tag})" if m.days_since_release is not None and m.last_release_tag else (f"{m.days_since_release}d" if m.days_since_release is not None else "N/A"),
+    "avg-issue-response": lambda m: f"{format_duration(m.avg_issue_response_hours)} (n={m.issue_response_sample_size})" if m.avg_issue_response_hours is not None else "N/A",
+    "avg-pr-response": lambda m: f"{format_duration(m.avg_pr_response_hours)} (n={m.pr_response_sample_size})" if m.avg_pr_response_hours is not None else "N/A",
+    "avg-pr-cycle": lambda m: f"{format_duration(m.avg_pr_cycle_hours)} (n={m.merged_pr_count})" if m.avg_pr_cycle_hours is not None else "N/A"
 }
 BACKOFF_FACTOR = 2.0
 RETRYABLE_ERRORS = frozenset({"rate limit", "502", "503", "504", "timeout"})
@@ -282,6 +282,46 @@ class RepoHealthMetrics:
     # Cycle time
     avg_pr_cycle_hours: Optional[float]
     merged_pr_count: int
+
+
+def format_duration(hours: Optional[float]) -> str:
+    """Convert hours to human-readable duration format.
+
+    Args:
+        hours: Duration in hours (can be None)
+
+    Returns:
+        Human-readable duration string:
+        - None -> "-"
+        - < 24 hours -> "4.2h" or "4h 12m" format
+        - >= 24 hours -> "2.5d" format
+    """
+    if hours is None:
+        return "-"
+
+    # Validate input for edge cases
+    import math
+    if not isinstance(hours, (int, float)) or math.isnan(hours) or math.isinf(hours) or hours < 0:
+        return "-"
+
+    # Handle days (>= 24 hours)
+    if hours >= 24:
+        days = hours / 24
+        return f"{int(days)}d" if days == int(days) else f"{days:.1f}d"
+
+    # Handle less than 1 hour (show in minutes)
+    if hours < 1:
+        return f"{round(hours * 60)}m"
+
+    # Handle whole hours
+    if hours == int(hours):
+        return f"{int(hours)}h"
+
+    # Handle hours with fractional part
+    whole_hours = int(hours)
+    remaining_minutes = round((hours - whole_hours) * 60)
+
+    return f"{whole_hours}h {remaining_minutes}m" if remaining_minutes > 0 else f"{whole_hours}h"
 
 
 def get_health_db_path() -> Path:
@@ -700,6 +740,10 @@ def collect_health_for_repos(
         else:
             print(f"Collecting fresh data for {len(tasks)} repo-week combinations...")
 
+        # Display rate limit before collection
+        if tasks:  # Only show if we're actually collecting data
+            display_rate_limit_info("before collection", dry_run)
+
         # Queue for collecting results from worker threads
         results_queue = queue.Queue()
 
@@ -753,6 +797,10 @@ def collect_health_for_repos(
 
         if written_count > 0:
             print(f"Saved {written_count} new health snapshots to database")
+
+        # Display rate limit after collection
+        if tasks:  # Only show if we actually collected data
+            display_rate_limit_info("after collection", dry_run)
 
         # Load final results from database (combines fresh + cached data)
         github_ids = [repo["id"] for repo in repos]
@@ -845,6 +893,72 @@ def gh_graphql(query: str, variables: Optional[dict] = None, dry_run: bool = Fal
             return None
 
     return None
+
+
+def get_github_rate_limit(dry_run: bool = False) -> tuple[int, str]:
+    """Query GitHub GraphQL API rate limit status.
+
+    Args:
+        dry_run: If True, return mock data instead of making API call
+
+    Returns:
+        Tuple of (remaining_points, reset_time_str)
+    """
+    if dry_run:
+        return (4500, "2026-01-12T17:00:00Z")
+
+    query = """
+    query {
+        rateLimit {
+            remaining
+            resetAt
+        }
+    }
+    """
+
+    try:
+        response = gh_graphql(query)
+        # Handle both wrapped ({"data": {"rateLimit": {...}}}) and unwrapped responses
+        if response:
+            data = response.get("data", response) if isinstance(response, dict) else response
+            if data and "rateLimit" in data:
+                remaining = data["rateLimit"]["remaining"]
+                reset_at = data["rateLimit"]["resetAt"]
+                return (remaining, reset_at)
+        return (0, "unknown")
+    except Exception as e:
+        print(f"Warning: Could not fetch rate limit info: {e}", file=sys.stderr)
+        return (0, "unknown")
+
+
+def display_rate_limit_info(label: str, dry_run: bool = False) -> None:
+    """Display current GitHub API rate limit status.
+
+    Args:
+        label: Description label (e.g., "before collection", "after collection")
+        dry_run: If True, show mock data
+    """
+    remaining, reset_at = get_github_rate_limit(dry_run)
+
+    if remaining == 0 and reset_at == "unknown":
+        print(f"Rate limit ({label}): Unable to fetch status")
+        return
+
+    # Parse reset time for better display (fallback to raw string on error)
+    reset_str = reset_at
+    try:
+        from datetime import datetime
+        # GitHub API returns ISO format: 2026-01-12T17:00:00Z
+        reset_dt = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
+        reset_str = reset_dt.strftime("%H:%M")
+    except (ValueError, TypeError):
+        pass  # Use raw reset_at value as fallback
+
+    print(f"Rate limit ({label}): {remaining}/5000 remaining (resets at {reset_str})")
+
+    # Warning if approaching limit
+    if remaining < 1000:
+        print(f"Warning: Rate limit is low ({remaining} remaining)", file=sys.stderr)
 
 
 def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, until_dt: datetime, dry_run: bool = False) -> Optional[dict]:
@@ -1086,8 +1200,8 @@ def parse_graphql_health_response(data: dict, repo_full_name: str, week_start: d
                 created_at = parse_datetime(created_at_str)
                 merged_at = parse_datetime(merged_at_str)
 
-                # Only include PRs that were created and merged within our time period
-                if not (week_start <= created_at <= week_end and week_start <= merged_at <= week_end):
+                # Only include PRs that were merged within our time period
+                if not (week_start <= merged_at <= week_end):
                     continue
 
                 cycle_time_hours = (merged_at - created_at).total_seconds() / 3600
@@ -2292,6 +2406,63 @@ def display_single_week_health_table(repos_data: dict[str, list[RepoHealthMetric
             values.append(formatted_value)
 
         print("| " + " | ".join(values) + " |")
+
+    # Calculate and display Total/Average row
+    if sorted_repos:
+        total_values = ["**Total/Average**"]
+
+        # Define calculation methods for each metric type
+        count_metrics = {"open-issues", "open-prs", "new-issues", "new-prs"}
+        time_metrics = {"avg-issue-response", "avg-pr-response", "avg-pr-cycle"}
+
+        for metric in display_metrics:
+            if metric in count_metrics:
+                # Sum for count metrics
+                total = sum(getattr(metrics, metric.replace("-", "_")) for _, metrics in sorted_repos)
+                total_values.append(f"**{total}**")
+            elif metric in time_metrics:
+                # Weighted average for time metrics using sample sizes
+                field_name = metric.replace("-", "_") + "_hours"
+
+                # Get sample size field name based on metric type
+                if metric == "avg-issue-response":
+                    sample_size_field = "issue_response_sample_size"
+                elif metric == "avg-pr-response":
+                    sample_size_field = "pr_response_sample_size"
+                elif metric == "avg-pr-cycle":
+                    sample_size_field = "merged_pr_count"
+                else:
+                    sample_size_field = None
+
+                # Calculate weighted average
+                weighted_sum = 0
+                total_weight = 0
+
+                for _, metrics in sorted_repos:
+                    value = getattr(metrics, field_name)
+                    sample_size = getattr(metrics, sample_size_field) if sample_size_field else 1
+
+                    if value is not None and sample_size > 0:
+                        weighted_sum += value * sample_size
+                        total_weight += sample_size
+
+                avg_value = weighted_sum / total_weight if total_weight > 0 else None
+                formatted = f"**{format_duration(avg_value)}**" if avg_value is not None else "**-**"
+                total_values.append(formatted)
+            elif metric == "days-since-release":
+                # Average for days since release (only repos with releases)
+                values_with_data = [
+                    metrics.days_since_release
+                    for _, metrics in sorted_repos
+                    if metrics.days_since_release is not None
+                ]
+                avg_value = sum(values_with_data) / len(values_with_data) if values_with_data else None
+                formatted = f"**{avg_value:.0f}d**" if avg_value is not None else "**-**"
+                total_values.append(formatted)
+            else:
+                total_values.append("**-**")
+
+        print("| " + " | ".join(total_values) + " |")
 
 
 def display_health_trends(repos_data: dict[str, list[RepoHealthMetrics]], display_metrics: list[str], num_weeks: int) -> None:
