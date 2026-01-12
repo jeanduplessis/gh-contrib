@@ -961,6 +961,8 @@ def render_trend_charts(
         plt.clear_figure()
         plt.plotsize(80, 15)
         plt.theme("dark")
+        plt.canvas_color("default")  # Use terminal background (transparent)
+        plt.axes_color("default")    # Make axes area transparent too
         plt.title(title)
 
         # Calculate values and track max for y-axis scaling
