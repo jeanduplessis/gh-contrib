@@ -48,6 +48,30 @@ PASSIVE_INTERACTION_TYPES = frozenset({"review-requested", "assignee", "mentione
 # Retry configuration
 MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1.0  # seconds
+
+# Health metric extraction functions (used in hot paths)
+HEALTH_METRIC_EXTRACTORS = {
+    "open-issues": lambda m: float(m.open_issues),
+    "open-prs": lambda m: float(m.open_prs),
+    "new-issues": lambda m: float(m.new_issues),
+    "new-prs": lambda m: float(m.new_prs),
+    "days-since-release": lambda m: float(m.days_since_release) if m.days_since_release is not None else None,
+    "avg-issue-response": lambda m: m.avg_issue_response_hours,
+    "avg-pr-response": lambda m: m.avg_pr_response_hours,
+    "avg-pr-cycle": lambda m: m.avg_pr_cycle_hours
+}
+
+# Health metric formatting functions (used in hot paths)
+HEALTH_METRIC_FORMATTERS = {
+    "open-issues": lambda m: str(m.open_issues),
+    "open-prs": lambda m: str(m.open_prs),
+    "new-issues": lambda m: str(m.new_issues),
+    "new-prs": lambda m: str(m.new_prs),
+    "days-since-release": lambda m: str(m.days_since_release) if m.days_since_release is not None else "N/A",
+    "avg-issue-response": lambda m: f"{m.avg_issue_response_hours:.1f}" if m.avg_issue_response_hours is not None else "N/A",
+    "avg-pr-response": lambda m: f"{m.avg_pr_response_hours:.1f}" if m.avg_pr_response_hours is not None else "N/A",
+    "avg-pr-cycle": lambda m: f"{m.avg_pr_cycle_hours:.1f}" if m.avg_pr_cycle_hours is not None else "N/A"
+}
 BACKOFF_FACTOR = 2.0
 RETRYABLE_ERRORS = frozenset({"rate limit", "502", "503", "504", "timeout"})
 VALID_METRICS = frozenset({
@@ -499,6 +523,253 @@ def get_cached_weeks(conn: sqlite3.Connection, github_id: int) -> set[str]:
     return {row["week_start"] for row in cursor}
 
 
+def get_week_boundaries(num_weeks: int) -> list[tuple[datetime, datetime]]:
+    """Calculate week boundaries for the last N complete weeks.
+
+    Args:
+        num_weeks: Number of weeks to generate boundaries for
+
+    Returns:
+        List of (week_start, week_end) tuples, ordered from oldest to newest
+        Each week starts Monday 00:00:00 UTC and ends Sunday 23:59:59 UTC
+    """
+    today = datetime.now(timezone.utc)
+    days_since_monday = today.weekday()
+
+    # Find the Monday of the last complete week
+    last_complete_monday = today - timedelta(days=days_since_monday + 7)
+    last_complete_monday = last_complete_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    boundaries = []
+    for week_offset in range(num_weeks - 1, -1, -1):  # Go from oldest to newest
+        week_start = last_complete_monday - timedelta(weeks=week_offset)
+        week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        boundaries.append((week_start, week_end))
+
+    return boundaries
+
+
+def list_org_repos(org: str) -> list[dict]:
+    """Fetch all repositories in an organization.
+
+    Args:
+        org: Organization name
+
+    Returns:
+        List of repository dictionaries with id, node_id, name, full_name
+    """
+    repos = []
+    page = 1
+
+    while page <= MAX_PAGINATION_PAGES:
+        endpoint = f"orgs/{org}/repos?per_page={API_PAGE_SIZE}&page={page}"
+        result = gh_api_cached(endpoint)
+
+        if not result or not isinstance(result, list):
+            break
+
+        # Extract minimal required fields with safe dictionary access
+        required_fields = ["id", "node_id", "name", "full_name"]
+        page_repos = [
+            {field: repo.get(field) for field in required_fields}
+            for repo in result
+            if all(field in repo for field in required_fields)  # Only include repos with all required fields
+        ]
+        repos.extend(page_repos)
+
+        # If we got less than a full page, we're done
+        if len(result) < API_PAGE_SIZE:
+            break
+
+        page += 1
+
+    return repos
+
+
+def collect_repo_health_metrics(
+    repo: dict,
+    week_start: datetime,
+    week_end: datetime,
+    ignore_users: set[str],
+    dry_run: bool = False
+) -> Optional[RepoHealthMetrics]:
+    """Collect all health metrics for one repository for one week.
+
+    Args:
+        repo: Repository dictionary with id, node_id, name, full_name
+        week_start: Start of the week being measured
+        week_end: End of the week being measured
+        ignore_users: Set of usernames to ignore for response time calculations
+        dry_run: If True, preview queries without executing
+
+    Returns:
+        RepoHealthMetrics object or None if collection failed
+    """
+    repo_full_name = repo["full_name"]
+
+    try:
+        # Fetch all health metrics using a single GraphQL query
+        health_data = fetch_repo_health_graphql(repo_full_name, week_start, week_end, dry_run=dry_run)
+
+        if not health_data or dry_run:
+            return None
+
+        # Parse the GraphQL response into structured metrics
+        metrics = parse_graphql_health_response(
+            health_data, repo_full_name, week_start, week_end, ignore_users
+        )
+
+        return metrics
+
+    except Exception as e:
+        print(f"Error collecting health metrics for {repo_full_name}: {e}", file=sys.stderr)
+        return None
+
+
+def collect_health_for_repos(
+    repos: list[dict],
+    num_weeks: int,
+    ignore_users: set[str],
+    refresh: bool = False,
+    dry_run: bool = False
+) -> dict[str, list[RepoHealthMetrics]]:
+    """Collect health metrics for multiple repositories over multiple weeks.
+
+    Uses producer-consumer pattern: threads collect metrics, main thread writes to SQLite.
+    Only fetches weeks not already in cache (unless refresh=True).
+
+    Args:
+        repos: List of repository dictionaries with id, node_id, name, full_name
+        num_weeks: Number of weeks to collect metrics for
+        ignore_users: Set of usernames to ignore for response time calculations
+        refresh: If True, collect data even for cached weeks
+        dry_run: If True, preview queries without executing
+
+    Returns:
+        Dictionary mapping repo full_name to list of RepoHealthMetrics (newest first)
+    """
+    import queue
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if dry_run:
+        print("Dry run mode - would collect health metrics for:")
+        week_boundaries = get_week_boundaries(num_weeks)
+        for repo in repos[:5]:  # Show first 5 repos
+            print(f"  {repo['full_name']}")
+        print(f"  ... and {len(repos) - 5} more repos" if len(repos) > 5 else "")
+
+        # Only run dry-run collection if we have repos
+        if repos:
+            for week_start, week_end in week_boundaries:
+                collect_repo_health_metrics(repos[0], week_start, week_end, ignore_users, dry_run=True)
+        else:
+            print("  No repositories found to analyze")
+        return {}
+
+    # Initialize database
+    conn = init_health_db()
+    results_by_repo: dict[str, list[RepoHealthMetrics]] = {}
+
+    try:
+        # Get week boundaries
+        week_boundaries = get_week_boundaries(num_weeks)
+
+        # Build list of tasks (repo, week_start, week_end) that need collection
+        tasks = []
+        cached_count = 0
+        total_tasks = 0
+
+        for repo in repos:
+            repo_github_id = repo["id"]
+            cached_weeks = get_cached_weeks(conn, repo_github_id)
+
+            for week_start, week_end in week_boundaries:
+                total_tasks += 1
+                week_start_str = week_start.strftime("%Y-%m-%d")
+
+                if refresh or week_start_str not in cached_weeks:
+                    tasks.append((repo, week_start, week_end))
+                else:
+                    cached_count += 1
+
+        if cached_count > 0:
+            print(f"Using cached data for {cached_count}/{total_tasks} repo-week combinations")
+
+        if not tasks:
+            print("All data already cached")
+        else:
+            print(f"Collecting fresh data for {len(tasks)} repo-week combinations...")
+
+        # Queue for collecting results from worker threads
+        results_queue = queue.Queue()
+
+        def collect_worker(repo, week_start, week_end):
+            """Worker function to collect metrics for one repo-week combination."""
+            try:
+                metrics = collect_repo_health_metrics(repo, week_start, week_end, ignore_users)
+                if metrics:
+                    results_queue.put(metrics)
+            except Exception as e:
+                print(f"Worker error for {repo['full_name']}: {e}", file=sys.stderr)
+
+        # Execute collection tasks in parallel with immediate result processing
+        written_count = 0
+        if tasks:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = []
+                for repo, week_start, week_end in tasks:
+                    future = executor.submit(collect_worker, repo, week_start, week_end)
+                    futures.append(future)
+
+                # Process results immediately as they become available
+                for future in as_completed(futures):
+                    try:
+                        future.result()  # This will raise if the worker failed
+
+                        # Check for new results in queue and write them immediately
+                        while not results_queue.empty():
+                            try:
+                                metrics = results_queue.get_nowait()
+                                save_health_snapshot(conn, metrics)
+                                written_count += 1
+                            except queue.Empty:
+                                break
+                            except Exception as e:
+                                print(f"Database write error: {e}", file=sys.stderr)
+
+                    except Exception as e:
+                        print(f"Task execution error: {e}", file=sys.stderr)
+
+        # Final cleanup: process any remaining results in queue
+        while not results_queue.empty():
+            try:
+                metrics = results_queue.get_nowait()
+                save_health_snapshot(conn, metrics)
+                written_count += 1
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"Database write error: {e}", file=sys.stderr)
+
+        if written_count > 0:
+            print(f"Saved {written_count} new health snapshots to database")
+
+        # Load final results from database (combines fresh + cached data)
+        github_ids = [repo["id"] for repo in repos]
+        db_results = load_health_snapshots(conn, github_ids, num_weeks)
+
+        # Convert to repo full_name keyed results
+        for repo in repos:
+            repo_github_id = repo["id"]
+            repo_full_name = repo["full_name"]
+            results_by_repo[repo_full_name] = db_results.get(repo_github_id, [])
+
+        return results_by_repo
+
+    finally:
+        conn.close()
+
+
 def gh_graphql(query: str, variables: Optional[dict] = None, dry_run: bool = False) -> Optional[dict]:
     """Execute a GraphQL query using gh CLI.
 
@@ -576,12 +847,13 @@ def gh_graphql(query: str, variables: Optional[dict] = None, dry_run: bool = Fal
     return None
 
 
-def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, dry_run: bool = False) -> Optional[dict]:
+def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, until_dt: datetime, dry_run: bool = False) -> Optional[dict]:
     """Fetch repository health metrics using a single GraphQL query.
 
     Args:
         repo_full_name: Repository in format "owner/repo"
         since_dt: Start datetime for new issues/PRs query
+        until_dt: End datetime for new issues/PRs query
         dry_run: If True, preview query without executing
 
     Returns:
@@ -598,10 +870,11 @@ def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, dry_run: 
 
     # Format datetime for search queries (without timezone for search compatibility)
     since_search = since_dt.strftime("%Y-%m-%d")
+    until_search = until_dt.strftime("%Y-%m-%d")
 
-    # Build search queries for new and merged PRs
-    new_prs_query = f"repo:{repo_full_name} is:pr created:>={since_search}"
-    merged_prs_query = f"repo:{repo_full_name} is:pr is:merged merged:>={since_search}"
+    # Build search queries for new and merged PRs using bounded date ranges
+    new_prs_query = f"repo:{repo_full_name} is:pr created:{since_search}..{until_search}"
+    merged_prs_query = f"repo:{repo_full_name} is:pr is:merged merged:{since_search}..{until_search}"
 
     query = """
     query RepoHealth($owner: String!, $name: String!, $since: DateTime!, $queryNewPrs: String!, $queryMergedPrs: String!) {
@@ -799,27 +1072,31 @@ def parse_graphql_health_response(data: dict, repo_full_name: str, week_start: d
         )
 
         # Calculate PR cycle time from merged PRs sample
-        avg_pr_cycle_hours = None
         merged_prs_sample = repo.get("mergedPrsSample", {}).get("nodes", [])
-        if merged_prs_sample:
-            cycle_times = []
-            for pr in merged_prs_sample:
-                created_at_str = pr.get("createdAt")
-                merged_at_str = pr.get("mergedAt")
-                if created_at_str and merged_at_str:
-                    try:
-                        created_at = parse_datetime(created_at_str)
-                        merged_at = parse_datetime(merged_at_str)
-                        # Only include PRs that were created and merged within our time period
-                        if week_start <= created_at <= week_end and week_start <= merged_at <= week_end:
-                            cycle_time_hours = (merged_at - created_at).total_seconds() / 3600
-                            if cycle_time_hours >= 0:  # Sanity check
-                                cycle_times.append(cycle_time_hours)
-                    except (ValueError, TypeError):
-                        continue  # Skip invalid timestamps
+        cycle_times = []
 
-            if cycle_times:
-                avg_pr_cycle_hours = sum(cycle_times) / len(cycle_times)
+        for pr in merged_prs_sample:
+            created_at_str = pr.get("createdAt")
+            merged_at_str = pr.get("mergedAt")
+
+            if not (created_at_str and merged_at_str):
+                continue
+
+            try:
+                created_at = parse_datetime(created_at_str)
+                merged_at = parse_datetime(merged_at_str)
+
+                # Only include PRs that were created and merged within our time period
+                if not (week_start <= created_at <= week_end and week_start <= merged_at <= week_end):
+                    continue
+
+                cycle_time_hours = (merged_at - created_at).total_seconds() / 3600
+                if cycle_time_hours >= 0:  # Sanity check
+                    cycle_times.append(cycle_time_hours)
+            except (ValueError, TypeError):
+                continue  # Skip invalid timestamps
+
+        avg_pr_cycle_hours = sum(cycle_times) / len(cycle_times) if cycle_times else None
 
         # Release information
         days_since_release = None
@@ -1654,7 +1931,6 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--username", "-u",
-        required=True,
         help="GitHub username(s) to search for (comma-separated)"
     )
     parser.add_argument(
@@ -1773,12 +2049,15 @@ def calculate_date_range(args: argparse.Namespace) -> tuple[datetime, datetime]:
 
 def parse_user_inputs(args: argparse.Namespace) -> tuple[list[str], list[str]]:
     """Parse and validate usernames and organizations."""
-    usernames = [u.strip() for u in args.username.split(",") if u.strip()]
-    orgs = [o.strip() for o in args.org.split(",") if o.strip()]
+    # Handle optional username (e.g., in health mode)
+    usernames = []
+    if args.username:
+        usernames = [u.strip() for u in args.username.split(",") if u.strip()]
+        if not usernames:
+            print("Error: No valid usernames provided", file=sys.stderr)
+            sys.exit(1)
 
-    if not usernames:
-        print("Error: No valid usernames provided", file=sys.stderr)
-        sys.exit(1)
+    orgs = [o.strip() for o in args.org.split(",") if o.strip()]
     if not orgs:
         print("Error: No valid organizations provided", file=sys.stderr)
         sys.exit(1)
@@ -1866,132 +2145,255 @@ def run_health_mode(
     usernames: list[str],
     orgs: list[str]
 ) -> None:
-    """Handle health mode execution."""
+    """Handle health mode execution using orchestration functions with caching."""
     # Parse ignore users if provided
     ignore_users = set()
     if args.ignore_users:
         ignore_users = {u.strip() for u in args.ignore_users.split(",") if u.strip()}
 
-    # Parse health metrics
+    # Parse health metrics to display
+    display_metrics = HEALTH_METRICS
     if args.health_metrics:
-        metrics = [m.strip() for m in args.health_metrics.split(",")]
-        invalid = set(metrics) - VALID_HEALTH_METRICS
+        display_metrics = [m.strip() for m in args.health_metrics.split(",")]
+        invalid = set(display_metrics) - VALID_HEALTH_METRICS
         if invalid:
             print(f"Error: Invalid health metrics: {', '.join(invalid)}")
             print(f"Valid metrics: {', '.join(HEALTH_METRICS)}")
             sys.exit(1)
-    else:
-        metrics = HEALTH_METRICS
 
-    # Determine repos to analyze
+    # Use --weeks parameter for health mode (default to 1 week if not specified)
+    num_weeks = getattr(args, 'weeks', 1)
+
+    # Determine repositories to analyze
+    all_repos = []
     if args.repos:
-        repos = [r.strip() for r in args.repos.split(",") if r.strip()]
+        # Parse specific repos
+        repo_names = [r.strip() for r in args.repos.split(",") if r.strip()]
+        for repo_name in repo_names:
+            # For specific repos, we need to fetch their metadata
+            try:
+                owner, repo = repo_name.split("/", 1)
+                repo_data = gh_api_cached(f"repos/{owner}/{repo}")
+                if repo_data:
+                    all_repos.append({
+                        "id": repo_data["id"],
+                        "node_id": repo_data["node_id"],
+                        "name": repo_data["name"],
+                        "full_name": repo_data["full_name"]
+                    })
+            except (ValueError, TypeError):
+                print(f"Warning: Invalid repo format '{repo_name}', expected 'owner/repo'", file=sys.stderr)
+                continue
     else:
-        # Fetch all repos from the organizations
-        repos = []
+        # Fetch all repos from organizations
         for org in orgs:
-            org_repos_data = gh_api(f"orgs/{org}/repos?per_page=100")
-            if org_repos_data:
-                for repo in org_repos_data:
-                    repos.append(repo["full_name"])
+            org_repos = list_org_repos(org)
+            all_repos.extend(org_repos)
 
-    if not repos:
+    if not all_repos:
         print("Error: No repositories to analyze", file=sys.stderr)
         sys.exit(1)
 
-    # Calculate week range
-    week_start, week_end = get_last_complete_week()
-
-    print(f"Analyzing health metrics for {len(repos)} repositories...")
-    if args.debug:
-        print(f"Week: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
-        print(f"Repos: {', '.join(repos[:5])}{'...' if len(repos) > 5 else ''}\n")
-
-    # Fetch health data for each repo
-    health_results = []
-    for repo in repos:
+    # Show initial status
+    if num_weeks == 1:
+        week_start, week_end = get_last_complete_week()
+        print(f"Analyzing health metrics for {len(all_repos)} repositories...")
         if args.debug:
-            print(f"Processing {repo}...", end=" ", flush=True)
+            print(f"Week: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
+            print(f"Repos: {', '.join([r['full_name'] for r in all_repos[:5]])}{'...' if len(all_repos) > 5 else ''}")
+    else:
+        orgs_str = ", ".join(orgs)
+        print(f"Analyzing {num_weeks}-week health trends for {len(all_repos)} repositories in {orgs_str}...")
 
-        # Fetch health metrics
-        health_data = fetch_repo_health_graphql(repo, week_start, args.dry_run)
-        if health_data and not args.dry_run:
-            # Pre-compute lowercase ignore set for efficiency
-            ignore_users_lower = {user.lower() for user in ignore_users}
-
-            metrics = parse_graphql_health_response(
-                health_data, repo, week_start, week_end, ignore_users_lower
-            )
-            if metrics:
-                health_results.append(metrics)
-                if args.debug:
-                    print(f"✓ ({metrics.open_issues} issues, {metrics.open_prs} PRs)")
-            else:
-                if args.debug:
-                    print("✗ (parsing failed)")
-        else:
-            if args.debug:
-                print("✗ (fetch failed)" if not args.dry_run else "✓ (dry run)")
+    # Collect health metrics using orchestration functions
+    results_by_repo = collect_health_for_repos(
+        repos=all_repos,
+        num_weeks=num_weeks,
+        ignore_users=ignore_users,
+        refresh=args.refresh,
+        dry_run=args.dry_run
+    )
 
     if args.dry_run:
         print("\nDry run completed. No data was fetched or processed.")
         return
 
-    if not health_results:
+    if not results_by_repo:
         print("No health data could be collected.")
         return
 
-    # Display results
+    # Filter out repos with no data
+    repos_with_data = {repo_name: metrics_list for repo_name, metrics_list in results_by_repo.items() if metrics_list}
+
+    if not repos_with_data:
+        print("No health data available for the requested time period.")
+        return
+
+    print(f"\nCollected health data for {len(repos_with_data)} repositories.")
+
+    if num_weeks == 1:
+        # Single week: display detailed table
+        display_single_week_health_table(repos_with_data, display_metrics)
+    else:
+        # Multiple weeks: display trends
+        display_health_trends(repos_with_data, display_metrics, num_weeks)
+
+
+def display_single_week_health_table(repos_data: dict[str, list[RepoHealthMetrics]], display_metrics: list[str]) -> None:
+    """Display health metrics for a single week in table format."""
+    # Get the most recent metrics for each repo
+    latest_metrics = {}
+    week_range = None
+
+    for repo_name, metrics_list in repos_data.items():
+        if metrics_list:
+            latest_metrics[repo_name] = metrics_list[0]  # Most recent first
+            if week_range is None:
+                week_range = (metrics_list[0].week_start, metrics_list[0].week_end)
+
+    if not latest_metrics:
+        print("No current week data available.")
+        return
+
+    # Print header
+    week_start, week_end = week_range
     print(f"\n## Repository Health Metrics")
     print(f"Week: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}\n")
 
-    # Create summary table
-    headers = ["Repository", "Open Issues", "Open PRs", "New Issues", "New PRs",
-               "Days Since Release", "Avg Issue Response (hrs)", "Avg PR Response (hrs)", "Avg PR Cycle (hrs)"]
+    # Define all possible headers and their corresponding metric names
+    all_headers_map = {
+        "open-issues": "Open Issues",
+        "open-prs": "Open PRs",
+        "new-issues": "New Issues",
+        "new-prs": "New PRs",
+        "days-since-release": "Days Since Release",
+        "avg-issue-response": "Avg Issue Response (hrs)",
+        "avg-pr-response": "Avg PR Response (hrs)",
+        "avg-pr-cycle": "Avg PR Cycle (hrs)"
+    }
 
     # Filter headers based on requested metrics
-    if args.health_metrics:
-        metric_to_header = {
-            "open-issues": "Open Issues",
-            "open-prs": "Open PRs",
-            "new-issues": "New Issues",
-            "new-prs": "New PRs",
-            "days-since-release": "Days Since Release",
-            "avg-issue-response": "Avg Issue Response (hrs)",
-            "avg-pr-response": "Avg PR Response (hrs)",
-            "avg-pr-cycle": "Avg PR Cycle (hrs)"
-        }
-        filtered_headers = ["Repository"] + [metric_to_header[m] for m in metrics if m in metric_to_header]
-        headers = filtered_headers
+    headers = ["Repository"] + [all_headers_map[m] for m in display_metrics if m in all_headers_map]
 
-    # Sort by repository name
-    health_results.sort(key=lambda x: x.repo_full_name)
+    # Sort repositories by name
+    sorted_repos = sorted(latest_metrics.items(), key=lambda x: x[0])
 
-    # Print table
+    # Print table headers
     print("| " + " | ".join(headers) + " |")
     print("|" + "|".join("-" * (len(h) + 2) for h in headers) + "|")
 
-    for health in health_results:
-        values = [health.repo_full_name, str(health.open_issues), str(health.open_prs),
-                  str(health.new_issues), str(health.new_prs)]
+    # Print data rows
+    for repo_name, metrics in sorted_repos:
+        values = [repo_name]
 
-        # Add release info
-        values.append(str(health.days_since_release) if health.days_since_release is not None else "N/A")
-
-        # Add response times
-        values.append(f"{health.avg_issue_response_hours:.1f}" if health.avg_issue_response_hours is not None else "N/A")
-        values.append(f"{health.avg_pr_response_hours:.1f}" if health.avg_pr_response_hours is not None else "N/A")
-        values.append(f"{health.avg_pr_cycle_hours:.1f}" if health.avg_pr_cycle_hours is not None else "N/A")
-
-        # Filter values based on requested metrics if specified
-        if args.health_metrics:
-            metric_indices = {"Repository": 0, "Open Issues": 1, "Open PRs": 2, "New Issues": 3,
-                            "New PRs": 4, "Days Since Release": 5, "Avg Issue Response (hrs)": 6,
-                            "Avg PR Response (hrs)": 7, "Avg PR Cycle (hrs)": 8}
-            filtered_values = [values[metric_indices[h]] for h in headers if h in metric_indices]
-            values = filtered_values
+        for metric in display_metrics:
+            formatter = HEALTH_METRIC_FORMATTERS.get(metric)
+            formatted_value = formatter(metrics) if formatter else "N/A"
+            values.append(formatted_value)
 
         print("| " + " | ".join(values) + " |")
+
+
+def display_health_trends(repos_data: dict[str, list[RepoHealthMetrics]], display_metrics: list[str], num_weeks: int) -> None:
+    """Display health trends over multiple weeks."""
+    if not PLOTEXT_AVAILABLE:
+        print("Error: plotext is required for health trend charts. Install with: pip install plotext")
+        return
+
+    # Collect all weeks represented in the data, using full date for sorting
+    all_weeks = set()
+    for metrics_list in repos_data.values():
+        for metrics in metrics_list:
+            # Store full date for proper sorting across years
+            all_weeks.add(metrics.week_start.date())
+
+    # Sort by full date, then create display labels
+    sorted_week_dates = sorted(list(all_weeks))
+    weeks = [date.strftime("%m/%d") for date in sorted_week_dates]
+    week_date_lookup = {date.strftime("%m/%d"): date for date in sorted_week_dates}
+    if len(weeks) < num_weeks:
+        print(f"Warning: Only {len(weeks)} weeks of data available (requested {num_weeks})")
+
+    print(f"\n## Health Trends - Last {len(weeks)} Weeks\n")
+
+    # Create charts for each requested metric
+    metric_titles = {
+        "open-issues": "Open Issues",
+        "open-prs": "Open PRs",
+        "new-issues": "New Issues",
+        "new-prs": "New PRs",
+        "days-since-release": "Days Since Last Release",
+        "avg-issue-response": "Avg Issue Response Time (hours)",
+        "avg-pr-response": "Avg PR Response Time (hours)",
+        "avg-pr-cycle": "Avg PR Cycle Time (hours)"
+    }
+
+    # Use numeric x-axis with week labels as xticks
+    x_values = list(range(len(weeks)))
+
+    for metric in display_metrics:
+        if metric not in metric_titles:
+            continue
+
+        title = metric_titles[metric]
+
+        plt.clear_figure()
+        plt.plotsize(80, 15)
+        plt.theme("dark")
+        plt.canvas_color("default")
+        plt.axes_color("default")
+        plt.title(title)
+
+        # Calculate aggregate values across all repos for each week
+        aggregate_values = []
+        for week in weeks:
+            total_value = 0
+            count = 0
+
+            for repo_name, metrics_list in repos_data.items():
+                for metrics in metrics_list:
+                    # Use exact date comparison instead of formatted string
+                    if metrics.week_start.date() == week_date_lookup[week]:
+                        value = get_health_metric_value(metrics, metric)
+                        if value is not None:
+                            total_value += value
+                            count += 1
+                        break
+
+            # Calculate average for this week
+            if count > 0:
+                if metric in ["avg-issue-response", "avg-pr-response", "avg-pr-cycle"]:
+                    aggregate_values.append(total_value / count)  # Average of averages
+                else:
+                    aggregate_values.append(total_value)  # Sum for counts
+            else:
+                aggregate_values.append(0)
+
+        # Plot the trend
+        plt.plot(x_values, aggregate_values, marker="braille")
+
+        # Set appropriate y-axis ticks
+        max_val = max(aggregate_values) if aggregate_values else 0
+        if max_val <= 5:
+            ytick_values = list(range(0, int(max_val) + 2))
+        else:
+            step = max(1, int((max_val + 4) // 5))
+            ytick_values = list(range(0, int(max_val) + step + 1, step))
+        ytick_labels = [f"{v:3d}" if v == int(v) else f"{v:3.1f}" for v in ytick_values]
+        plt.yticks(ytick_values, ytick_labels)
+
+        plt.xticks(x_values, weeks)
+        plt.xlabel("Week")
+        plt.ylabel("Count" if metric not in ["avg-issue-response", "avg-pr-response", "avg-pr-cycle"] else "Hours")
+
+        plt.show()
+        print()
+
+
+def get_health_metric_value(metrics: RepoHealthMetrics, metric: str) -> Optional[float]:
+    """Extract a specific metric value from RepoHealthMetrics."""
+    extractor = HEALTH_METRIC_EXTRACTORS.get(metric)
+    return extractor(metrics) if extractor else None
 
 
 def print_detailed_results(
@@ -2147,12 +2549,20 @@ def main() -> None:
     # Validate gh CLI is installed and authenticated
     validate_gh_cli()
 
+    # Validate argument dependencies
+    if not args.health and not args.username:
+        print("Error: --username is required for normal and trend modes", file=sys.stderr)
+        sys.exit(1)
+
     # Parse inputs and calculate date range
     since_dt, end_dt = calculate_date_range(args)
     usernames, orgs = parse_user_inputs(args)
 
     # Handle trend mode
     if args.trend:
+        if not usernames:
+            print("Error: No valid usernames provided for trend analysis", file=sys.stderr)
+            sys.exit(1)
         run_trend_mode(args, usernames, orgs)
         return
 
@@ -2160,6 +2570,11 @@ def main() -> None:
     if args.health:
         run_health_mode(args, usernames, orgs)
         return
+
+    # For normal activity mode, ensure we have usernames
+    if not usernames:
+        print("Error: No valid usernames provided for activity search", file=sys.stderr)
+        sys.exit(1)
 
     # Fetch activity using shared function
     use_cache = not args.no_cache
