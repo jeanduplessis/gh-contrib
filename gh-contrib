@@ -114,14 +114,14 @@ def get_cache_dir() -> Path:
 
 def get_cache_key(usernames: list[str], orgs: list[str], since_dt: datetime, end_dt: datetime) -> str:
     """Generate a cache key hash from query parameters."""
-    key_parts = [
-        ",".join(sorted(u.lower() for u in usernames)),
-        ",".join(sorted(o.lower() for o in orgs)),
-        since_dt.strftime("%Y-%m-%d"),
-        end_dt.strftime("%Y-%m-%d"),
-    ]
-    key_str = "|".join(key_parts)
-    return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+    sorted_usernames = ",".join(sorted(username.lower() for username in usernames))
+    sorted_orgs = ",".join(sorted(org.lower() for org in orgs))
+    since_date = since_dt.strftime("%Y-%m-%d")
+    end_date = end_dt.strftime("%Y-%m-%d")
+
+    key_parts = [sorted_usernames, sorted_orgs, since_date, end_date]
+    combined_key = "|".join(key_parts)
+    return hashlib.sha256(combined_key.encode()).hexdigest()[:16]
 
 
 def load_from_cache(cache_key: str) -> Optional[dict]:
@@ -512,11 +512,10 @@ def process_item(item: dict, username: str, since: datetime, until: datetime) ->
     interactions.extend(additional)
 
     # Determine the latest interaction timestamp
-    latest_interaction = None
-    if latest_basic_interaction and latest_additional_interaction:
-        latest_interaction = max(latest_basic_interaction, latest_additional_interaction)
-    else:
-        latest_interaction = latest_basic_interaction or latest_additional_interaction
+    latest_interaction = max(
+        filter(None, [latest_basic_interaction, latest_additional_interaction]),
+        default=None
+    )
 
     # If no specific interaction found, mark as "mentioned" (catch-all for involves)
     if not interactions:
@@ -757,13 +756,12 @@ def fetch_activity(
     filtered_items = []
     for item in processed_items:
         interactions = item.get("_interactions", [])
-        base_interactions = set()
-        for interaction in interactions:
-            base, _ = parse_interaction(interaction)
-            base_interactions.add(base)
-        is_passive = base_interactions.issubset(PASSIVE_INTERACTION_TYPES)
-        has_recent = item.get("_latest_interaction") is not None
-        if not is_passive and has_recent:
+        base_interactions = {parse_interaction(interaction)[0] for interaction in interactions}
+
+        is_passive_only = base_interactions.issubset(PASSIVE_INTERACTION_TYPES)
+        has_recent_interaction = item.get("_latest_interaction") is not None
+
+        if not is_passive_only and has_recent_interaction:
             active_items.append(item)
         else:
             filtered_items.append(item)
@@ -901,6 +899,27 @@ def collect_weekly_stats(
     return weekly_data
 
 
+def get_metric_value(stats: UserStats, metric: str) -> int:
+    """Get the value for a specific metric from UserStats.
+
+    Raises:
+        ValueError: If metric is not a valid metric name.
+    """
+    metric_accessors = {
+        "prs-authored": lambda s: s.prs_authored,
+        "prs-reviewed": lambda s: s.prs_reviewed,
+        "prs-commented": lambda s: s.prs_commented,
+        "issues-authored": lambda s: s.issues_authored,
+        "issues-commented": lambda s: s.issues_commented,
+        "total": lambda s: s.total(),
+    }
+
+    if metric not in metric_accessors:
+        raise ValueError(f"Unknown metric: {metric}. Valid metrics: {', '.join(VALID_METRICS)}")
+
+    return metric_accessors[metric](stats)
+
+
 def render_trend_charts(
     weekly_data: dict[str, dict[str, UserStats]],
     usernames: list[str],
@@ -921,16 +940,6 @@ def render_trend_charts(
 
     weeks = list(weekly_data.keys())
 
-    # Map metric names to accessor functions
-    metric_accessors = {
-        "prs-authored": lambda s: s.prs_authored,
-        "prs-reviewed": lambda s: s.prs_reviewed,
-        "prs-commented": lambda s: s.prs_commented,
-        "issues-authored": lambda s: s.issues_authored,
-        "issues-commented": lambda s: s.issues_commented,
-        "total": lambda s: s.total(),
-    }
-
     metric_titles = {
         "prs-authored": "PRs Authored",
         "prs-reviewed": "PRs Reviewed",
@@ -944,11 +953,10 @@ def render_trend_charts(
     x_values = list(range(len(weeks)))
 
     for metric in metrics:
-        if metric not in metric_accessors:
+        if metric not in VALID_METRICS:
             continue
 
-        accessor = metric_accessors[metric]
-        title = metric_titles[metric]
+        title = metric_titles.get(metric, metric)
 
         plt.clear_figure()
         plt.plotsize(80, 15)
@@ -960,13 +968,13 @@ def render_trend_charts(
         if by_user and len(usernames) > 1:
             # Show separate lines per user
             for username in usernames:
-                values = [accessor(weekly_data[week].get(username, UserStats())) for week in weeks]
+                values = [get_metric_value(weekly_data[week].get(username, UserStats()), metric) for week in weeks]
                 all_values.extend(values)
                 plt.plot(x_values, values, label=username, marker="braille")
         else:
             # Show totals (aggregate all users)
             values = [
-                sum(accessor(weekly_data[week].get(u, UserStats())) for u in usernames)
+                sum(get_metric_value(weekly_data[week].get(u, UserStats()), metric) for u in usernames)
                 for week in weeks
             ]
             all_values = values
@@ -1148,21 +1156,10 @@ def run_trend_mode(
     for week in weeks:
         values = [week]
         for metric in metrics:
-            total = 0
-            for username in usernames:
-                stats = weekly_data[week].get(username, UserStats())
-                if metric == "prs-authored":
-                    total += stats.prs_authored
-                elif metric == "prs-reviewed":
-                    total += stats.prs_reviewed
-                elif metric == "prs-commented":
-                    total += stats.prs_commented
-                elif metric == "issues-authored":
-                    total += stats.issues_authored
-                elif metric == "issues-commented":
-                    total += stats.issues_commented
-                elif metric == "total":
-                    total += stats.total()
+            total = sum(
+                get_metric_value(weekly_data[week].get(username, UserStats()), metric)
+                for username in usernames
+            )
             values.append(str(total))
         rows.append(values)
 
@@ -1224,12 +1221,17 @@ def print_detailed_results(
                     i for i in item.get("_interactions", [])
                     if f"(@{username})" in i
                 ]
+                if not user_interactions:
+                    continue
+
                 # Check if user has active (non-passive) interactions
-                base_interactions = set(parse_interaction(i)[0] for i in user_interactions)
-                if base_interactions and not base_interactions.issubset(PASSIVE_INTERACTION_TYPES):
-                    item_copy = item.copy()
-                    item_copy["_interactions"] = user_interactions
-                    user_items.append(item_copy)
+                base_interactions = {parse_interaction(i)[0] for i in user_interactions}
+                if not base_interactions or base_interactions.issubset(PASSIVE_INTERACTION_TYPES):
+                    continue
+
+                item_copy = item.copy()
+                item_copy["_interactions"] = user_interactions
+                user_items.append(item_copy)
 
             if not user_items:
                 continue
