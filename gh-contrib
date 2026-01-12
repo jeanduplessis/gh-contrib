@@ -499,6 +499,365 @@ def get_cached_weeks(conn: sqlite3.Connection, github_id: int) -> set[str]:
     return {row["week_start"] for row in cursor}
 
 
+def gh_graphql(query: str, variables: Optional[dict] = None, dry_run: bool = False) -> Optional[dict]:
+    """Execute a GraphQL query using gh CLI.
+
+    Args:
+        query: The GraphQL query string
+        variables: Optional variables dictionary for the query
+        dry_run: If True, print the query without executing it
+
+    Returns:
+        Parsed JSON response from GraphQL API, or None on error/dry_run
+    """
+    if dry_run:
+        print("GraphQL Query:")
+        print(query)
+        if variables:
+            print("\nVariables:")
+            print(json.dumps(variables, indent=2, default=str))
+        print()
+        return None
+
+    # Build command with query and variables
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    if variables:
+        for key, value in variables.items():
+            cmd.extend(["-F", f"{key}={value}"])
+
+    delay = INITIAL_RETRY_DELAY
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=SUBPROCESS_TIMEOUT)
+            data = json.loads(result.stdout)
+
+            # Check for GraphQL errors
+            if "errors" in data:
+                error_messages = [error.get("message", "Unknown error") for error in data["errors"]]
+                print(f"GraphQL errors: {', '.join(error_messages)}", file=sys.stderr)
+                return None
+
+            return data.get("data")
+
+        except subprocess.TimeoutExpired:
+            if attempt < MAX_RETRIES:
+                print(f"GraphQL query timed out, retrying in {delay}s...", file=sys.stderr)
+                time.sleep(delay)
+                delay *= BACKOFF_FACTOR
+                continue
+            print(f"Warning: GraphQL query timed out after {MAX_RETRIES} retries", file=sys.stderr)
+            return None
+
+        except subprocess.CalledProcessError as e:
+            stderr_lower = e.stderr.lower() if e.stderr else ""
+            is_retryable = any(err in stderr_lower for err in RETRYABLE_ERRORS)
+
+            if is_retryable and attempt < MAX_RETRIES:
+                msg = "rate limit hit" if "rate limit" in stderr_lower else "server error"
+                print(f"GraphQL {msg}, retrying in {delay}s...", file=sys.stderr)
+                time.sleep(delay)
+                delay *= BACKOFF_FACTOR
+                continue
+
+            # Handle final error
+            if "rate limit" in stderr_lower:
+                print("Warning: GitHub GraphQL API rate limit exhausted", file=sys.stderr)
+            elif "not found" in stderr_lower or "404" in stderr_lower:
+                print("Warning: Repository not found or not accessible", file=sys.stderr)
+            else:
+                print(f"Error executing GraphQL query: {e.stderr}", file=sys.stderr)
+            return None
+
+        except json.JSONDecodeError:
+            print("Warning: Invalid JSON response from GraphQL API", file=sys.stderr)
+            return None
+
+    return None
+
+
+def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, dry_run: bool = False) -> Optional[dict]:
+    """Fetch repository health metrics using a single GraphQL query.
+
+    Args:
+        repo_full_name: Repository in format "owner/repo"
+        since_dt: Start datetime for new issues/PRs query
+        dry_run: If True, preview query without executing
+
+    Returns:
+        Dictionary containing health metrics, or None on error/dry_run
+    """
+    try:
+        owner, repo = repo_full_name.split("/", 1)
+    except ValueError:
+        print(f"Invalid repository format: {repo_full_name}. Expected 'owner/repo'", file=sys.stderr)
+        return None
+
+    # Format datetime for GraphQL (ISO 8601)
+    since_iso = since_dt.isoformat()
+
+    # Format datetime for search queries (without timezone for search compatibility)
+    since_search = since_dt.strftime("%Y-%m-%d")
+
+    # Build search queries for new and merged PRs
+    new_prs_query = f"repo:{repo_full_name} is:pr created:>={since_search}"
+    merged_prs_query = f"repo:{repo_full_name} is:pr is:merged merged:>={since_search}"
+
+    query = """
+    query RepoHealth($owner: String!, $name: String!, $since: DateTime!, $queryNewPrs: String!, $queryMergedPrs: String!) {
+      repository(owner: $owner, name: $name) {
+        id
+        databaseId
+
+        # Open issues count
+        openIssues: issues(states: OPEN) { totalCount }
+
+        # Open PRs count
+        openPRs: pullRequests(states: OPEN) { totalCount }
+
+        # New issues in period
+        newIssues: issues(filterBy: {since: $since}) { totalCount }
+
+        # Sample of open issues for response time (most recent 50)
+        issuesSample: issues(states: OPEN, first: 50, orderBy: {field: CREATED_AT, direction: DESC}) {
+          nodes {
+            createdAt
+            author { login }
+            comments(first: 10) {
+              nodes {
+                createdAt
+                author { login }
+              }
+            }
+          }
+        }
+
+        # Sample of open PRs for response time
+        prsSample: pullRequests(states: OPEN, first: 50, orderBy: {field: CREATED_AT, direction: DESC}) {
+          nodes {
+            createdAt
+            author { login }
+            comments(first: 10) {
+              nodes {
+                createdAt
+                author { login }
+              }
+            }
+            reviews(first: 10) {
+              nodes {
+                createdAt
+                author { login }
+              }
+            }
+          }
+        }
+
+        # Merged PRs for cycle time calculation (recent 50)
+        mergedPrsSample: pullRequests(states: MERGED, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
+          nodes {
+            createdAt
+            mergedAt
+            author { login }
+          }
+        }
+
+        # Latest release
+        latestRelease: releases(first: 1, orderBy: {field: CREATED_AT, direction: DESC}) {
+          nodes {
+            tagName
+            publishedAt
+            isDraft
+            isPrerelease
+          }
+        }
+      }
+
+      # Search for new PRs in the period
+      newPRs: search(query: $queryNewPrs, type: ISSUE, first: 0) { issueCount }
+
+      # Search for merged PRs in the period
+      mergedPRsCount: search(query: $queryMergedPrs, type: ISSUE, first: 0) { issueCount }
+    }
+    """
+
+    variables = {
+        "owner": owner,
+        "name": repo,
+        "since": since_iso,
+        "queryNewPrs": new_prs_query,
+        "queryMergedPrs": merged_prs_query
+    }
+
+    return gh_graphql(query, variables, dry_run=dry_run)
+
+
+def is_bot_user(username: str, ignore_list_lower: set[str]) -> bool:
+    """Check if a user appears to be a bot based on patterns and ignore lists.
+
+    Args:
+        username: GitHub username to check
+        ignore_list_lower: Pre-computed lowercase set of usernames to treat as bots
+
+    Returns:
+        True if the user appears to be a bot
+    """
+    if not username:
+        return True
+
+    username_lower = username.lower()
+
+    # Check custom ignore list, known bots, or bot suffix patterns
+    return (
+        username_lower in ignore_list_lower
+        or username_lower in KNOWN_BOTS
+        or any(username.endswith(suffix) for suffix in BOT_SUFFIXES)
+    )
+
+
+def calculate_response_time_hours(items: list[dict], ignore_users: set[str]) -> tuple[Optional[float], int]:
+    """Calculate average response time in hours for a list of issues/PRs.
+
+    Args:
+        items: List of issues/PRs with author and comments/reviews data
+        ignore_users: Set of usernames to ignore (bots, etc.)
+
+    Returns:
+        Tuple of (average_hours, sample_size) where average_hours is None if no qualifying responses
+    """
+    response_times = []
+
+    # Pre-compute lowercase ignore users set for efficiency
+    ignore_users_lower = {user.lower() for user in ignore_users}
+
+    for item in items:
+        author_login = item.get("author", {}).get("login", "").lower()
+        created_at = parse_datetime(item["createdAt"])
+        first_response_time = None
+
+        # Check both comments and reviews using the same logic
+        for response_type in ["comments", "reviews"]:
+            for response in item.get(response_type, {}).get("nodes", []):
+                response_author = response.get("author", {}).get("login", "")
+                if not response_author:
+                    continue
+
+                response_author_lower = response_author.lower()
+
+                # Skip if author or bot
+                if (response_author_lower == author_login or
+                    is_bot_user(response_author, ignore_users_lower)):
+                    continue
+
+                response_time = parse_datetime(response["createdAt"])
+                if first_response_time is None or response_time < first_response_time:
+                    first_response_time = response_time
+
+        # Calculate response time if we found a qualifying response
+        if first_response_time:
+            response_time_hours = (first_response_time - created_at).total_seconds() / 3600
+            response_times.append(response_time_hours)
+
+    if not response_times:
+        return None, len(items)
+
+    return sum(response_times) / len(response_times), len(items)
+
+
+def parse_graphql_health_response(data: dict, repo_full_name: str, week_start: datetime, week_end: datetime, ignore_users: set[str]) -> Optional[RepoHealthMetrics]:
+    """Parse GraphQL response into RepoHealthMetrics.
+
+    Args:
+        data: GraphQL response data
+        repo_full_name: Repository name in "owner/repo" format
+        week_start: Start of the week being measured
+        week_end: End of the week being measured
+        ignore_users: Set of usernames to ignore for response time calculations
+
+    Returns:
+        RepoHealthMetrics object or None if parsing failed
+    """
+    repo = data.get("repository") if data else None
+    if not repo:
+        return None
+
+    try:
+        # Core counts (use .get() with nested defaults)
+        open_issues = repo.get("openIssues", {}).get("totalCount", 0)
+        open_prs = repo.get("openPRs", {}).get("totalCount", 0)
+        new_issues = repo.get("newIssues", {}).get("totalCount", 0)
+
+        # Get new and merged PR counts from search results
+        new_prs = data.get("newPRs", {}).get("issueCount", 0)
+        merged_pr_count = data.get("mergedPRsCount", {}).get("issueCount", 0)
+
+        # Calculate response times
+        avg_issue_response_hours, issue_response_sample_size = calculate_response_time_hours(
+            repo.get("issuesSample", {}).get("nodes", []), ignore_users
+        )
+        avg_pr_response_hours, pr_response_sample_size = calculate_response_time_hours(
+            repo.get("prsSample", {}).get("nodes", []), ignore_users
+        )
+
+        # Calculate PR cycle time from merged PRs sample
+        avg_pr_cycle_hours = None
+        merged_prs_sample = repo.get("mergedPrsSample", {}).get("nodes", [])
+        if merged_prs_sample:
+            cycle_times = []
+            for pr in merged_prs_sample:
+                created_at_str = pr.get("createdAt")
+                merged_at_str = pr.get("mergedAt")
+                if created_at_str and merged_at_str:
+                    try:
+                        created_at = parse_datetime(created_at_str)
+                        merged_at = parse_datetime(merged_at_str)
+                        # Only include PRs that were created and merged within our time period
+                        if week_start <= created_at <= week_end and week_start <= merged_at <= week_end:
+                            cycle_time_hours = (merged_at - created_at).total_seconds() / 3600
+                            if cycle_time_hours >= 0:  # Sanity check
+                                cycle_times.append(cycle_time_hours)
+                    except (ValueError, TypeError):
+                        continue  # Skip invalid timestamps
+
+            if cycle_times:
+                avg_pr_cycle_hours = sum(cycle_times) / len(cycle_times)
+
+        # Release information
+        days_since_release = None
+        last_release_tag = None
+        releases = repo.get("latestRelease", {}).get("nodes", [])
+        if releases:
+            release = releases[0]
+            published_at = release.get("publishedAt")
+            if (published_at and not release.get("isDraft") and not release.get("isPrerelease")):
+                release_time = parse_datetime(published_at)
+                days_since_release = int((datetime.now(timezone.utc) - release_time).total_seconds() / 86400)
+                last_release_tag = release.get("tagName")
+
+        return RepoHealthMetrics(
+            repo_full_name=repo_full_name,
+            github_id=repo["databaseId"],
+            node_id=repo["id"],
+            week_start=week_start,
+            week_end=week_end,
+            open_issues=open_issues,
+            open_prs=open_prs,
+            new_issues=new_issues,
+            new_prs=new_prs,
+            days_since_release=days_since_release,
+            last_release_tag=last_release_tag,
+            avg_issue_response_hours=avg_issue_response_hours,
+            avg_pr_response_hours=avg_pr_response_hours,
+            issue_response_sample_size=issue_response_sample_size,
+            pr_response_sample_size=pr_response_sample_size,
+            avg_pr_cycle_hours=avg_pr_cycle_hours,
+            merged_pr_count=merged_pr_count
+        )
+
+    except (KeyError, TypeError, ValueError) as e:
+        print(f"Error parsing GraphQL response for {repo_full_name}: {e}", file=sys.stderr)
+        return None
+
+
 def is_pull_request(item: dict) -> bool:
     """Determine if an item is a pull request."""
     return (
@@ -1367,6 +1726,34 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Clear all cached data and exit"
     )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="Enable health stats mode: analyze repository health metrics"
+    )
+    parser.add_argument(
+        "--repos",
+        type=str,
+        default=None,
+        help="Comma-separated repos (owner/repo). Defaults to all in --org"
+    )
+    parser.add_argument(
+        "--health-metrics",
+        type=str,
+        default=None,
+        help="Comma-separated metrics to display (default: all)"
+    )
+    parser.add_argument(
+        "--ignore-users",
+        type=str,
+        default=None,
+        help="Comma-separated usernames to treat as bots for response time"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview API calls without executing them (useful for debugging and rate limit planning)"
+    )
     return parser.parse_args()
 
 
@@ -1472,6 +1859,139 @@ def run_trend_mode(
         formatted_values += [v.rjust(w) for v, w in zip(row[1:], col_widths[1:])]  # Numbers right-aligned
         formatted_row = "| " + " | ".join(formatted_values) + " |"
         print(formatted_row)
+
+
+def run_health_mode(
+    args: argparse.Namespace,
+    usernames: list[str],
+    orgs: list[str]
+) -> None:
+    """Handle health mode execution."""
+    # Parse ignore users if provided
+    ignore_users = set()
+    if args.ignore_users:
+        ignore_users = {u.strip() for u in args.ignore_users.split(",") if u.strip()}
+
+    # Parse health metrics
+    if args.health_metrics:
+        metrics = [m.strip() for m in args.health_metrics.split(",")]
+        invalid = set(metrics) - VALID_HEALTH_METRICS
+        if invalid:
+            print(f"Error: Invalid health metrics: {', '.join(invalid)}")
+            print(f"Valid metrics: {', '.join(HEALTH_METRICS)}")
+            sys.exit(1)
+    else:
+        metrics = HEALTH_METRICS
+
+    # Determine repos to analyze
+    if args.repos:
+        repos = [r.strip() for r in args.repos.split(",") if r.strip()]
+    else:
+        # Fetch all repos from the organizations
+        repos = []
+        for org in orgs:
+            org_repos_data = gh_api(f"orgs/{org}/repos?per_page=100")
+            if org_repos_data:
+                for repo in org_repos_data:
+                    repos.append(repo["full_name"])
+
+    if not repos:
+        print("Error: No repositories to analyze", file=sys.stderr)
+        sys.exit(1)
+
+    # Calculate week range
+    week_start, week_end = get_last_complete_week()
+
+    print(f"Analyzing health metrics for {len(repos)} repositories...")
+    if args.debug:
+        print(f"Week: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
+        print(f"Repos: {', '.join(repos[:5])}{'...' if len(repos) > 5 else ''}\n")
+
+    # Fetch health data for each repo
+    health_results = []
+    for repo in repos:
+        if args.debug:
+            print(f"Processing {repo}...", end=" ", flush=True)
+
+        # Fetch health metrics
+        health_data = fetch_repo_health_graphql(repo, week_start, args.dry_run)
+        if health_data and not args.dry_run:
+            # Pre-compute lowercase ignore set for efficiency
+            ignore_users_lower = {user.lower() for user in ignore_users}
+
+            metrics = parse_graphql_health_response(
+                health_data, repo, week_start, week_end, ignore_users_lower
+            )
+            if metrics:
+                health_results.append(metrics)
+                if args.debug:
+                    print(f"✓ ({metrics.open_issues} issues, {metrics.open_prs} PRs)")
+            else:
+                if args.debug:
+                    print("✗ (parsing failed)")
+        else:
+            if args.debug:
+                print("✗ (fetch failed)" if not args.dry_run else "✓ (dry run)")
+
+    if args.dry_run:
+        print("\nDry run completed. No data was fetched or processed.")
+        return
+
+    if not health_results:
+        print("No health data could be collected.")
+        return
+
+    # Display results
+    print(f"\n## Repository Health Metrics")
+    print(f"Week: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}\n")
+
+    # Create summary table
+    headers = ["Repository", "Open Issues", "Open PRs", "New Issues", "New PRs",
+               "Days Since Release", "Avg Issue Response (hrs)", "Avg PR Response (hrs)", "Avg PR Cycle (hrs)"]
+
+    # Filter headers based on requested metrics
+    if args.health_metrics:
+        metric_to_header = {
+            "open-issues": "Open Issues",
+            "open-prs": "Open PRs",
+            "new-issues": "New Issues",
+            "new-prs": "New PRs",
+            "days-since-release": "Days Since Release",
+            "avg-issue-response": "Avg Issue Response (hrs)",
+            "avg-pr-response": "Avg PR Response (hrs)",
+            "avg-pr-cycle": "Avg PR Cycle (hrs)"
+        }
+        filtered_headers = ["Repository"] + [metric_to_header[m] for m in metrics if m in metric_to_header]
+        headers = filtered_headers
+
+    # Sort by repository name
+    health_results.sort(key=lambda x: x.repo_full_name)
+
+    # Print table
+    print("| " + " | ".join(headers) + " |")
+    print("|" + "|".join("-" * (len(h) + 2) for h in headers) + "|")
+
+    for health in health_results:
+        values = [health.repo_full_name, str(health.open_issues), str(health.open_prs),
+                  str(health.new_issues), str(health.new_prs)]
+
+        # Add release info
+        values.append(str(health.days_since_release) if health.days_since_release is not None else "N/A")
+
+        # Add response times
+        values.append(f"{health.avg_issue_response_hours:.1f}" if health.avg_issue_response_hours is not None else "N/A")
+        values.append(f"{health.avg_pr_response_hours:.1f}" if health.avg_pr_response_hours is not None else "N/A")
+        values.append(f"{health.avg_pr_cycle_hours:.1f}" if health.avg_pr_cycle_hours is not None else "N/A")
+
+        # Filter values based on requested metrics if specified
+        if args.health_metrics:
+            metric_indices = {"Repository": 0, "Open Issues": 1, "Open PRs": 2, "New Issues": 3,
+                            "New PRs": 4, "Days Since Release": 5, "Avg Issue Response (hrs)": 6,
+                            "Avg PR Response (hrs)": 7, "Avg PR Cycle (hrs)": 8}
+            filtered_values = [values[metric_indices[h]] for h in headers if h in metric_indices]
+            values = filtered_values
+
+        print("| " + " | ".join(values) + " |")
 
 
 def print_detailed_results(
@@ -1634,6 +2154,11 @@ def main() -> None:
     # Handle trend mode
     if args.trend:
         run_trend_mode(args, usernames, orgs)
+        return
+
+    # Handle health mode
+    if args.health:
+        run_health_mode(args, usernames, orgs)
         return
 
     # Fetch activity using shared function
