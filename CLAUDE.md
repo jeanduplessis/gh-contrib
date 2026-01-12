@@ -8,7 +8,7 @@ This repository contains `gh-contrib`, an executable Python script that fetches 
 
 ## Requirements
 
-- Python 3.9+ (uses modern type hints like `list[dict]`)
+- Python 3.14+
 - GitHub CLI (`gh`) must be installed and authenticated (https://cli.github.com/)
 - No external Python dependencies beyond standard library
 

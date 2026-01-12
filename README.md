@@ -8,7 +8,7 @@ Track GitHub contributions across users and organizations.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.14+
 - [GitHub CLI](https://cli.github.com/) installed and authenticated
 
 ## Usage
