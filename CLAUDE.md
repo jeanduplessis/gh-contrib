@@ -99,3 +99,121 @@ Markdown tables include:
 - Interactions (comma-separated list)
 
 Summary section shows PR/Issue count breakdown and interaction type frequency.
+
+## Health Stats Mode
+
+The script includes a `--health` mode that analyzes repository health metrics over time, tracking trends in issue/PR activity, response times, and release cadence.
+
+### Health Mode Overview
+
+Health mode collects and displays key repository health metrics:
+- **Issue/PR Counts**: Open issues, open PRs, new issues/PRs in time period
+- **Response Times**: Average time to first response on issues and PRs
+- **Release Activity**: Days since last release
+- **PR Cycle Time**: Average time from PR creation to merge
+
+Data is stored in a local SQLite database (`~/.gh-contrib/health.db`) for historical trending and cached to minimize API calls.
+
+### Health Mode CLI Arguments
+
+```bash
+# Enable health stats mode
+--health                    Enable health stats mode (analyze repo health metrics)
+
+# Target specification
+--repos REPOS               Comma-separated repos (owner/repo). Defaults to all in --org
+--weeks WEEKS               Number of weeks of history to analyze (default: 4)
+
+# Metric filtering
+--health-metrics METRICS    Comma-separated metrics to display (default: all)
+                           Valid: open-issues, open-prs, new-issues, new-prs,
+                                 days-since-release, avg-issue-response,
+                                 avg-pr-response, avg-pr-cycle
+
+# Bot filtering
+--ignore-users USERS        Comma-separated usernames to treat as bots for response time
+
+# Data management
+--refresh                   Force refresh: fetch fresh data and update cache
+--dry-run                   Preview API calls without executing (for rate limit planning)
+```
+
+### Health Mode Usage Examples
+
+```bash
+# Basic health stats for all repos in org (4 weeks default)
+./gh-contrib --health --org crossplane
+
+# Specific repositories only
+./gh-contrib --health --org crossplane --repos crossplane/crossplane,crossplane/provider-aws
+
+# Extended history analysis
+./gh-contrib --health --org crossplane --weeks 8
+
+# Focus on specific metrics
+./gh-contrib --health --org crossplane --health-metrics open-issues,open-prs,avg-pr-response
+
+# Force refresh cached data (bypass cache)
+./gh-contrib --health --org crossplane --refresh
+
+# Preview API calls without execution (debugging/planning)
+./gh-contrib --health --org crossplane --dry-run
+
+# Custom bot filtering for response times
+./gh-contrib --health --org crossplane --ignore-users "ci-bot,release-automation"
+
+# Multi-org analysis with specific repos
+./gh-contrib --health --org "crossplane,kubernetes" --repos "crossplane/crossplane,kubernetes/kubernetes"
+```
+
+### Health Mode Output Format
+
+#### Current Stats Table
+Shows current week health metrics in a markdown table:
+```
+## Repository Health (Week of 01/06 - 01/12)
+
+| Repository | Open Issues | Open PRs | New Issues | New PRs | Last Release | Issue Response | PR Response | PR Cycle |
+|------------|-------------|----------|------------|---------|--------------|----------------|-------------|----------|
+| crossplane/crossplane | 124 | 23 | 5 | 12 | 14d (v1.15.0) | 4.2h (n=50) | 2.1h (n=45) | 36.5h |
+| crossplane/provider-aws | 89 | 15 | 3 | 8 | 7d (v0.47.0) | 6.8h (n=50) | 3.4h (n=38) | 48.2h |
+| **Total/Avg** | **213** | **38** | **8** | **20** | - | **5.5h** | **2.8h** | **42.4h** |
+```
+
+#### Trend Charts
+When `plotext` is available and multiple weeks are requested, displays ASCII trend charts showing metric evolution over time. One chart per metric, with lines for each repository.
+
+#### Column Descriptions
+- **Open Issues/PRs**: Current total count (excluding drafts for PRs)
+- **New Issues/PRs**: Items created within the week boundary
+- **Last Release**: Days since most recent non-draft, non-prerelease release
+- **Issue/PR Response**: Average hours to first non-author, non-bot comment/review (sample size in parentheses)
+- **PR Cycle**: Average hours from PR open to merge for PRs merged in the period
+
+### Health Mode Data Storage
+
+- **Database Location**: `~/.gh-contrib/health.db` (SQLite)
+- **Caching Strategy**: Week-based caching (Monday-Sunday UTC boundaries)
+- **Data Retention**: Indefinite (historical trending)
+- **Cache Invalidation**: Use `--refresh` to force fresh data collection
+
+### Health Mode Integration
+
+Health mode can be combined with existing workflow patterns:
+
+```bash
+# Use with existing Makefile patterns
+make health-crossplane
+
+# Chain with normal activity analysis
+./gh-contrib --health --org myorg --weeks 4
+./gh-contrib --username myuser --org myorg --last-week
+```
+
+### Health Metrics Definitions
+
+- **Response Time**: Time from item creation to first qualifying response (comment/review from non-author, non-bot user)
+- **PR Cycle Time**: Time from PR creation to merge (only merged PRs, not closed-without-merge)
+- **Bot Detection**: Users with `[bot]` suffix, known bot list, or custom `--ignore-users` list
+- **Sample Sizes**: Response times calculated from most recent 50 open items (deterministic sampling)
+- **Week Boundaries**: Monday 00:00:00 UTC to Sunday 23:59:59 UTC (inclusive)
