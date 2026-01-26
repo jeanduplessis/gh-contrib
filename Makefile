@@ -52,8 +52,5 @@ health-crossplane-dry-run:
 health-crossplane-trends:
 	$(PYTHON) ./gh-contrib --health --org crossplane --weeks 8
 
-health-kubernetes:
-	$(PYTHON) ./gh-contrib --health --org kubernetes --repos kubernetes/kubernetes,kubernetes/enhancements,kubernetes/website,kubernetes/community --weeks 4
-
 health-example:
-	$(PYTHON) ./gh-contrib --health --org crossplane --repos crossplane/crossplane,crossplane/provider-aws --health-metrics open-issues,open-prs,avg-pr-response,avg-pr-cycle --weeks 6 --ignore-users "dependabot,renovate"
+	$(PYTHON) ./gh-contrib --health --org crossplane --repos crossplane/crossplane,crossplane/crossplane-runtime --health-metrics open-issues,open-prs,avg-pr-response,avg-pr-cycle --weeks 6 --ignore-users "dependabot,renovate,coderabbitai"

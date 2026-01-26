@@ -84,7 +84,7 @@ ALL_METRICS = ["prs-authored", "prs-reviewed", "prs-commented", "issues-authored
 CACHE_VERSION = 1
 
 # Health stats constants
-HEALTH_DB_VERSION = 1
+HEALTH_DB_VERSION = 2
 HEALTH_METRICS = [
     "open-issues", "open-prs", "new-issues", "new-prs",
     "days-since-release", "avg-issue-response", "avg-pr-response", "avg-pr-cycle"
@@ -263,7 +263,7 @@ class RepoHealthMetrics:
     week_start: datetime
     week_end: datetime
 
-    # Core counts
+    # Core counts (open_issues/open_prs calculated as of week_end using search queries)
     open_issues: int
     open_prs: int
     new_issues: int
@@ -368,8 +368,8 @@ def init_health_db() -> sqlite3.Connection:
                 repo_id INTEGER NOT NULL,
                 week_start DATE NOT NULL,
                 week_end DATE NOT NULL,
-                open_issues INTEGER NOT NULL,
-                open_prs INTEGER NOT NULL,
+                open_issues INTEGER,
+                open_prs INTEGER,
                 new_issues INTEGER NOT NULL,
                 new_prs INTEGER NOT NULL,
                 days_since_release INTEGER,
@@ -394,11 +394,61 @@ def init_health_db() -> sqlite3.Connection:
         conn.execute("INSERT INTO schema_info (version) VALUES (?)", (HEALTH_DB_VERSION,))
         conn.commit()
     else:
-        # Handle future migrations
+        # Handle migrations
         cursor = conn.execute("SELECT MAX(version) FROM schema_info")
         current_version = cursor.fetchone()[0] or 0
+
+        if current_version < 2:
+            # Migration v1 -> v2: Allow NULL for open_issues/open_prs (point-in-time metrics)
+            # SQLite doesn't support ALTER COLUMN, so we recreate the table
+            conn.executescript("""
+                CREATE TABLE health_snapshots_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo_id INTEGER NOT NULL,
+                    week_start DATE NOT NULL,
+                    week_end DATE NOT NULL,
+                    open_issues INTEGER,
+                    open_prs INTEGER,
+                    new_issues INTEGER NOT NULL,
+                    new_prs INTEGER NOT NULL,
+                    days_since_release INTEGER,
+                    last_release_tag TEXT,
+                    avg_issue_response_hours REAL,
+                    avg_pr_response_hours REAL,
+                    issue_response_sample_size INTEGER,
+                    pr_response_sample_size INTEGER,
+                    avg_pr_cycle_hours REAL,
+                    merged_pr_count INTEGER,
+                    collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+                    UNIQUE(repo_id, week_start)
+                );
+
+                INSERT INTO health_snapshots_new SELECT * FROM health_snapshots;
+
+                DROP TABLE health_snapshots;
+
+                ALTER TABLE health_snapshots_new RENAME TO health_snapshots;
+
+                CREATE INDEX idx_snapshots_repo_week ON health_snapshots(repo_id, week_start);
+                CREATE INDEX idx_snapshots_week ON health_snapshots(week_start);
+            """)
+            # Set open_issues/open_prs to NULL for historical data that was backfilled
+            # (data where all rows for a repo have identical values - indicates backfill)
+            conn.execute("""
+                UPDATE health_snapshots
+                SET open_issues = NULL, open_prs = NULL
+                WHERE repo_id IN (
+                    SELECT repo_id FROM health_snapshots
+                    GROUP BY repo_id
+                    HAVING COUNT(DISTINCT open_issues) = 1 AND COUNT(*) > 1
+                )
+            """)
+            conn.execute("INSERT INTO schema_info (version) VALUES (2)")
+            conn.commit()
+
         if current_version < HEALTH_DB_VERSION:
-            conn.execute("INSERT INTO schema_info (version) VALUES (?)", (HEALTH_DB_VERSION,))
+            conn.execute("INSERT OR IGNORE INTO schema_info (version) VALUES (?)", (HEALTH_DB_VERSION,))
             conn.commit()
 
     return conn
@@ -530,6 +580,11 @@ def load_health_snapshots(
             hour=23, minute=59, second=59, tzinfo=timezone.utc
         )
 
+        # Handle NULL values from old data (before historical calculation was added)
+        # If open_issues/open_prs is NULL, skip this record (will trigger refresh)
+        if row["open_issues"] is None or row["open_prs"] is None:
+            continue
+
         metrics = RepoHealthMetrics(
             repo_full_name=row["full_name"],
             github_id=github_id,
@@ -555,9 +610,15 @@ def load_health_snapshots(
 
 
 def get_cached_weeks(conn: sqlite3.Connection, github_id: int) -> set[str]:
-    """Get cached week_start dates for a repository."""
+    """Get cached week_start dates for a repository.
+
+    Only returns weeks with complete data (non-NULL open_issues/open_prs).
+    This ensures old data with NULL values will be refreshed.
+    """
     cursor = conn.execute(
-        "SELECT s.week_start FROM health_snapshots s JOIN repos r ON s.repo_id = r.id WHERE r.github_id = ?",
+        """SELECT s.week_start FROM health_snapshots s
+           JOIN repos r ON s.repo_id = r.id
+           WHERE r.github_id = ? AND s.open_issues IS NOT NULL AND s.open_prs IS NOT NULL""",
         (github_id,)
     )
     return {row["week_start"] for row in cursor}
@@ -990,17 +1051,20 @@ def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, until_dt:
     new_prs_query = f"repo:{repo_full_name} is:pr created:{since_search}..{until_search}"
     merged_prs_query = f"repo:{repo_full_name} is:pr is:merged merged:{since_search}..{until_search}"
 
+    # Build search queries for historical open counts as of week_end (until_search)
+    # Open issues at point in time = (created before AND still open) + (created before AND closed after)
+    open_issues_still_open_query = f"repo:{repo_full_name} is:issue is:open created:<{until_search}"
+    open_issues_closed_after_query = f"repo:{repo_full_name} is:issue is:closed created:<{until_search} closed:>{until_search}"
+    # Open PRs at point in time = (created before AND still open) + (created before AND closed after) + (created before AND merged after)
+    open_prs_still_open_query = f"repo:{repo_full_name} is:pr is:open created:<{until_search}"
+    open_prs_closed_after_query = f"repo:{repo_full_name} is:pr is:closed created:<{until_search} closed:>{until_search}"
+    open_prs_merged_after_query = f"repo:{repo_full_name} is:pr is:merged created:<{until_search} merged:>{until_search}"
+
     query = """
-    query RepoHealth($owner: String!, $name: String!, $since: DateTime!, $queryNewPrs: String!, $queryMergedPrs: String!) {
+    query RepoHealth($owner: String!, $name: String!, $since: DateTime!, $queryNewPrs: String!, $queryMergedPrs: String!, $queryOpenIssuesStillOpen: String!, $queryOpenIssuesClosedAfter: String!, $queryOpenPrsStillOpen: String!, $queryOpenPrsClosedAfter: String!, $queryOpenPrsMergedAfter: String!) {
       repository(owner: $owner, name: $name) {
         id
         databaseId
-
-        # Open issues count
-        openIssues: issues(states: OPEN) { totalCount }
-
-        # Open PRs count
-        openPRs: pullRequests(states: OPEN) { totalCount }
 
         # New issues in period
         newIssues: issues(filterBy: {since: $since}) { totalCount }
@@ -1064,6 +1128,15 @@ def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, until_dt:
 
       # Search for merged PRs in the period
       mergedPRsCount: search(query: $queryMergedPrs, type: ISSUE, first: 0) { issueCount }
+
+      # Historical open issues count (as of week_end): still open + closed after
+      openIssuesStillOpen: search(query: $queryOpenIssuesStillOpen, type: ISSUE, first: 0) { issueCount }
+      openIssuesClosedAfter: search(query: $queryOpenIssuesClosedAfter, type: ISSUE, first: 0) { issueCount }
+
+      # Historical open PRs count (as of week_end): still open + closed after + merged after
+      openPrsStillOpen: search(query: $queryOpenPrsStillOpen, type: ISSUE, first: 0) { issueCount }
+      openPrsClosedAfter: search(query: $queryOpenPrsClosedAfter, type: ISSUE, first: 0) { issueCount }
+      openPrsMergedAfter: search(query: $queryOpenPrsMergedAfter, type: ISSUE, first: 0) { issueCount }
     }
     """
 
@@ -1072,7 +1145,12 @@ def fetch_repo_health_graphql(repo_full_name: str, since_dt: datetime, until_dt:
         "name": repo,
         "since": since_iso,
         "queryNewPrs": new_prs_query,
-        "queryMergedPrs": merged_prs_query
+        "queryMergedPrs": merged_prs_query,
+        "queryOpenIssuesStillOpen": open_issues_still_open_query,
+        "queryOpenIssuesClosedAfter": open_issues_closed_after_query,
+        "queryOpenPrsStillOpen": open_prs_still_open_query,
+        "queryOpenPrsClosedAfter": open_prs_closed_after_query,
+        "queryOpenPrsMergedAfter": open_prs_merged_after_query
     }
 
     return gh_graphql(query, variables, dry_run=dry_run)
@@ -1168,9 +1246,18 @@ def parse_graphql_health_response(data: dict, repo_full_name: str, week_start: d
         return None
 
     try:
-        # Core counts (use .get() with nested defaults)
-        open_issues = repo.get("openIssues", {}).get("totalCount", 0)
-        open_prs = repo.get("openPRs", {}).get("totalCount", 0)
+        # Calculate historical open counts from search results
+        # Open issues at week_end = (issues still open, created before week_end) + (issues closed after week_end, created before)
+        open_issues_still_open = data.get("openIssuesStillOpen", {}).get("issueCount", 0)
+        open_issues_closed_after = data.get("openIssuesClosedAfter", {}).get("issueCount", 0)
+        open_issues = open_issues_still_open + open_issues_closed_after
+
+        # Open PRs at week_end = (PRs still open) + (PRs closed after) + (PRs merged after)
+        open_prs_still_open = data.get("openPrsStillOpen", {}).get("issueCount", 0)
+        open_prs_closed_after = data.get("openPrsClosedAfter", {}).get("issueCount", 0)
+        open_prs_merged_after = data.get("openPrsMergedAfter", {}).get("issueCount", 0)
+        open_prs = open_prs_still_open + open_prs_closed_after + open_prs_merged_after
+
         new_issues = repo.get("newIssues", {}).get("totalCount", 0)
 
         # Get new and merged PR counts from search results
@@ -2418,7 +2505,8 @@ def display_single_week_health_table(repos_data: dict[str, list[RepoHealthMetric
         for metric in display_metrics:
             if metric in count_metrics:
                 # Sum for count metrics
-                total = sum(getattr(metrics, metric.replace("-", "_")) for _, metrics in sorted_repos)
+                field_name = metric.replace("-", "_")
+                total = sum(getattr(metrics, field_name) for _, metrics in sorted_repos)
                 total_values.append(f"**{total}**")
             elif metric in time_metrics:
                 # Weighted average for time metrics using sample sizes
@@ -2543,14 +2631,31 @@ def display_health_trends(repos_data: dict[str, list[RepoHealthMetrics]], displa
         # Plot the trend
         plt.plot(x_values, aggregate_values, marker="braille")
 
-        # Set appropriate y-axis ticks
+        # Set appropriate y-axis range and ticks
         max_val = max(aggregate_values) if aggregate_values else 0
-        if max_val <= 5:
-            ytick_values = list(range(0, int(max_val) + 2))
+        min_val = min(aggregate_values) if aggregate_values else 0
+
+        # For count metrics, always start y-axis at 0 for proper context
+        # For time metrics, can use data-driven range
+        if metric in ["avg-issue-response", "avg-pr-response", "avg-pr-cycle"]:
+            # Time metrics: use data range with some padding
+            y_min = max(0, min_val * 0.9)
+            y_max = max_val * 1.1
         else:
-            step = max(1, int((max_val + 4) // 5))
-            ytick_values = list(range(0, int(max_val) + step + 1, step))
-        ytick_labels = [f"{v:3d}" if v == int(v) else f"{v:3.1f}" for v in ytick_values]
+            # Count metrics: always start at 0
+            y_min = 0
+            y_max = max_val * 1.1 if max_val > 0 else 10
+
+        # Set explicit y-axis limits
+        plt.ylim(y_min, y_max)
+
+        # Generate y-axis ticks
+        if y_max <= 5:
+            ytick_values = list(range(0, int(y_max) + 2))
+        else:
+            step = max(1, int((y_max + 4) // 5))
+            ytick_values = list(range(int(y_min), int(y_max) + step + 1, step))
+        ytick_labels = [str(int(v)) for v in ytick_values]
         plt.yticks(ytick_values, ytick_labels)
 
         plt.xticks(x_values, weeks)
